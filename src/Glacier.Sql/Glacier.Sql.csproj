@@ -5,6 +5,10 @@
     <Nullable>enable</Nullable>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <Version>1.0.0</Version>
+    <Description>High-performance T-SQL query execution engine built on top of the Glacier.Polaris columnar memory DataFrame engine.</Description>
+    <Authors>Glacier Contributors</Authors>
+    <PackageTags>sql query-engine polaris dataframe arrow ipc db database transactional locks triggers</PackageTags>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
   </PropertyGroup>
 
   <ItemGroup>

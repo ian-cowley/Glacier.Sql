@@ -4,6 +4,10 @@
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <Version>1.0.0</Version>
+    <Description>Stdio-based JSON-RPC Model Context Protocol (MCP) server hosting the Glacier.Sql engine.</Description>
+    <Authors>Glacier Contributors</Authors>
+    <PackageTags>sql mcp model-context-protocol json-rpc database query-engine</PackageTags>
   </PropertyGroup>
 
   <ItemGroup>
