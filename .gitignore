@@ -1,0 +1,37 @@
+## Build outputs
+[Bb]in/
+[Oo]bj/
+[Ll]og/
+[Ll]ogs/
+
+## Visual Studio
+.vs/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+## JetBrains Rider
+.idea/
+*.sln.iml
+
+## Visual Studio Code
+.vscode/
+
+## NuGet Packages
+*.nupkg
+packages/
+project.lock.json
+project.assets.json
+
+## Testing and coverage
+TestResults/
+*.clog
+
+## User-specific and temporary files
+*.tmp
+*.temp
+*.log
+*catalog.json
+*.arrow
+*.ipc
