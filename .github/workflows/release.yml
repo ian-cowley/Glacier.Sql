@@ -32,6 +32,12 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
+      - name: Checkout Polaris
+        uses: actions/checkout@v4
+        with:
+          repository: ian-cowley/Glacier.Polaris
+          path: ../Glacier.Polaris
+
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
@@ -68,6 +74,12 @@ jobs:
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
+
+      - name: Checkout Polaris
+        uses: actions/checkout@v4
+        with:
+          repository: ian-cowley/Glacier.Polaris
+          path: ../Glacier.Polaris
 
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
