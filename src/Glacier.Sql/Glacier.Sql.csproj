@@ -9,9 +9,15 @@
     <Authors>Glacier Contributors</Authors>
     <PackageTags>sql query-engine polaris dataframe arrow ipc db database transactional locks triggers</PackageTags>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageId>Glacier.Sql</PackageId>
+    <RepositoryUrl>https://github.com/ian-cowley/Glacier.Sql</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <GeneratePackageOnBuild>false</GeneratePackageOnBuild>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
   </PropertyGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\..\..\Glacier.Polaris\src\Glacier.Polaris\Glacier.Polaris.csproj" />
+    <None Include="..\..\README.md" Pack="true" PackagePath="\" />
   </ItemGroup>
 </Project>

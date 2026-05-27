@@ -58,14 +58,28 @@ jobs:
           path: ./${{ matrix.artifact_name }}
 
   release:
-    name: Create GitHub Release
+    name: Create GitHub Release & Push NuGet Package
     needs: build
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
       - name: Download Artifacts
         uses: actions/download-artifact@v4
         with:
           merge-multiple: true
+
+      - name: Pack NuGet Package
+        run: dotnet pack src/Glacier.Sql/Glacier.Sql.csproj -c Release -o ./nuget
+
+      - name: Publish NuGet Package
+        run: dotnet nuget push ./nuget/*.nupkg -k ${{ secrets.NUGET_API_KEY }} -s https://api.nuget.org/v3/index.json --skip-duplicate
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
@@ -74,5 +88,6 @@ jobs:
             Glacier.Sql.Host-win-x64.zip
             Glacier.Sql.Host-linux-x64.tar.gz
             Glacier.Sql.Host-osx-x64.tar.gz
+            nuget/*.nupkg
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
