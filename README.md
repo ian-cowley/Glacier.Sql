@@ -1,5 +1,8 @@
 # Glacier.Sql
 
+[![NuGet Version](https://img.shields.io/nuget/v/Glacier.Sql.svg?style=flat-square)](https://www.nuget.org/packages/Glacier.Sql/)
+[![NuGet Downloads](https://img.shields.io/nuget/dt/Glacier.Sql.svg?style=flat-square)](https://www.nuget.org/packages/Glacier.Sql/)
+
 **Glacier.Sql** is a high-performance C# SQL query execution engine built directly on top of the **Glacier.Polaris** columnar, memory-efficient Arrow-backed DataFrame engine. It translates T-SQL queries into optimized Polaris `LazyFrame` expression pipelines, enabling low-overhead SQL access to columnar files on disk.
 
 ---
