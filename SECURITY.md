@@ -13,7 +13,10 @@ Only the latest release version is actively supported with security updates.
 
 We take security issues seriously. If you find a security vulnerability, please do not disclose it publicly or open a public issue. Instead, report it privately:
 
-- **Email**: send a detailed report to security@glacierdb.org.
-- **Content**: Include steps to reproduce, code snippets, or configurations that trigger the vulnerability.
+1. Navigate to the **Security** tab of the repository on GitHub.
+2. Click the **Report a vulnerability** button to submit a private draft advisory.
+3. Fill out the details of the vulnerability.
+
+Alternatively, you can email the maintainers directly at security@glacierdb.org.
 
 We will acknowledge receipt of your report within 48 hours and work with you to resolve the issue as quickly as possible.
