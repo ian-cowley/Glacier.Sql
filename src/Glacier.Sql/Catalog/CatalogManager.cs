@@ -1,7 +1,14 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
+using System.Text;
 using System.Text.Json;
+using Glacier.Polaris;
+using Glacier.Sql.Engine;
+using Glacier.Sql.Parser;
+using Glacier.Sql.Storage.BufferPool;
+using Glacier.Sql.Storage.Wal;
 
 namespace Glacier.Sql.Catalog
 {
@@ -44,7 +51,7 @@ namespace Glacier.Sql.Catalog
         public List<ViewMetadata> Views { get; set; } = new();
     }
 
-    public class CatalogManager
+    public class CatalogManager : IDisposable
     {
         private readonly string _catalogPath;
         private readonly string _dataDir;
@@ -52,15 +59,22 @@ namespace Glacier.Sql.Catalog
         private readonly Dictionary<string, TriggerMetadata> _triggers = new(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, ViewMetadata> _views = new(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, ThreadIndependentReaderWriterLock> _tableLocks = new(StringComparer.OrdinalIgnoreCase);
+        private WalWriter? _walWriter;
+
+        private readonly bool _ownsBufferPool;
 
         public string DataDirectory => _dataDir;
+        public TableBufferPool BufferPool { get; }
+        public WalWriter WalWriter => _walWriter ??= new WalWriter(Path.Combine(_dataDir, "glacier.wal"));
 
-        public CatalogManager(string? baseDir = null)
+        public CatalogManager(string? baseDir = null, TableBufferPool? bufferPool = null)
         {
             // By default, place the database data under the workspace/project 'Data' folder
             baseDir ??= Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Data");
             _dataDir = baseDir;
             _catalogPath = Path.Combine(_dataDir, "catalog.json");
+            _ownsBufferPool = bufferPool == null;
+            BufferPool = bufferPool ?? new TableBufferPool();
 
             Load();
         }
@@ -127,6 +141,9 @@ namespace Glacier.Sql.Catalog
 
                 // Recover any orphaned transaction backups from a previous crash
                 RecoverBackupFiles();
+
+                // Recover committed mutations from Write-Ahead Log
+                RecoverFromWal();
             }
             catch (Exception ex)
             {
@@ -155,6 +172,8 @@ namespace Glacier.Sql.Catalog
                         {
                             File.Copy(backupPath, meta.BackingFile, true);
                             File.Delete(backupPath);
+                            BufferPool.Invalidate(tableName);
+                            TableStorage.BufferPool.Invalidate(tableName);
                             Console.WriteLine($"[Recovery] Restored table '{tableName}' from transaction backup due to previous crash.");
                         }
                         catch (Exception ex)
@@ -172,6 +191,150 @@ namespace Glacier.Sql.Catalog
             catch (Exception ex)
             {
                 Console.WriteLine($"Error recovering transaction backups: {ex.Message}");
+            }
+        }
+
+        private void RecoverFromWal()
+        {
+            try
+            {
+                string walPath = Path.Combine(_dataDir, "glacier.wal");
+                if (!File.Exists(walPath)) return;
+
+                var records = WalReader.Read(walPath, out ulong checkpointLsn);
+                if (records.Count == 0) return;
+
+                var uncheckpointed = records.Where(r => r.Lsn > checkpointLsn).ToList();
+                if (uncheckpointed.Count == 0) return;
+
+                var committedTx = new HashSet<Guid>();
+                foreach (var r in uncheckpointed)
+                {
+                    if (r.Type == WalRecordType.TxCommit)
+                    {
+                        committedTx.Add(r.TxId);
+                    }
+                }
+
+                int replayedCount = 0;
+                foreach (var r in uncheckpointed)
+                {
+                    // Skip uncommitted multi-statement transactions
+                    if (r.TxId != Guid.Empty && !committedTx.Contains(r.TxId))
+                    {
+                        continue;
+                    }
+
+                    if (r.Type == WalRecordType.RowInsert)
+                    {
+                        var meta = GetTable(r.TableName);
+                        if (meta != null)
+                        {
+                            var entry = BufferPool.GetOrLoad(meta);
+                            var insertedDf = TableStorage.DeserializeDataFrame(r.Payload);
+                            using (entry.AcquireWriteLock())
+                            {
+                                entry.CurrentSnapshot = DataFrame.Concat(new[] { entry.CurrentSnapshot, insertedDf });
+                                entry.IsDirty = true;
+                                entry.LastAppliedLsn = r.Lsn;
+                            }
+                            replayedCount++;
+                        }
+                    }
+                    else if (r.Type == WalRecordType.RowDelete)
+                    {
+                        var meta = GetTable(r.TableName);
+                        if (meta != null)
+                        {
+                            var entry = BufferPool.GetOrLoad(meta);
+                            string deleteSql = Encoding.UTF8.GetString(r.Payload);
+                            using (entry.AcquireWriteLock())
+                            {
+                                if (string.IsNullOrWhiteSpace(deleteSql))
+                                {
+                                    entry.CurrentSnapshot = TableStorage.CreateEmptyDataFrame(meta.Columns);
+                                }
+                                else
+                                {
+                                    var lexer = new SqlLexer(deleteSql);
+                                    var tokens = lexer.Tokenize();
+                                    var parser = new TSqlParser(tokens);
+                                    var stmt = parser.Parse();
+                                    if (stmt is DeleteStatement del)
+                                    {
+                                        if (del.Where == null)
+                                        {
+                                            entry.CurrentSnapshot = TableStorage.CreateEmptyDataFrame(meta.Columns);
+                                        }
+                                        else
+                                        {
+                                            var planner = new QueryPlanner(this);
+                                            var conditionExpr = planner.CompileExpression(del.Where, del.TableName);
+                                            var keepExpr = conditionExpr.IsNull() | (conditionExpr == Expr.Lit(false));
+                                            entry.CurrentSnapshot = entry.CurrentSnapshot.Lazy().Filter(keepExpr).Collect().GetAwaiter().GetResult();
+                                        }
+                                    }
+                                }
+                                entry.IsDirty = true;
+                                entry.LastAppliedLsn = r.Lsn;
+                            }
+                            replayedCount++;
+                        }
+                    }
+                    else if (r.Type == WalRecordType.RowUpdate)
+                    {
+                        var meta = GetTable(r.TableName);
+                        if (meta != null)
+                        {
+                            var entry = BufferPool.GetOrLoad(meta);
+                            string updateSql = Encoding.UTF8.GetString(r.Payload);
+                            using (entry.AcquireWriteLock())
+                            {
+                                var lexer = new SqlLexer(updateSql);
+                                var tokens = lexer.Tokenize();
+                                var parser = new TSqlParser(tokens);
+                                var stmt = parser.Parse();
+                                if (stmt is UpdateStatement update)
+                                {
+                                    var planner = new QueryPlanner(this);
+                                    var conditionExpr = update.Where != null 
+                                        ? planner.CompileExpression(update.Where, update.TableName)
+                                        : Expr.Lit(true);
+
+                                    var updateMap = update.Assignments.ToDictionary(a => a.ColumnName, a => a.Expression, StringComparer.OrdinalIgnoreCase);
+                                    var projections = new List<Expr>();
+                                    foreach (var col in meta.Columns)
+                                    {
+                                        if (updateMap.TryGetValue(col.Name, out var assignExpr))
+                                        {
+                                            var valExpr = planner.CompileExpression(assignExpr, update.TableName);
+                                            var condProj = Expr.When(conditionExpr).Then(valExpr).Otherwise(Expr.Col(col.Name)).Alias(col.Name);
+                                            projections.Add(condProj);
+                                        }
+                                        else
+                                        {
+                                            projections.Add(Expr.Col(col.Name).Alias(col.Name));
+                                        }
+                                    }
+                                    entry.CurrentSnapshot = entry.CurrentSnapshot.Lazy().Select(projections.ToArray()).Collect().GetAwaiter().GetResult();
+                                }
+                                entry.IsDirty = true;
+                                entry.LastAppliedLsn = r.Lsn;
+                            }
+                            replayedCount++;
+                        }
+                    }
+                }
+
+                if (replayedCount > 0)
+                {
+                    BufferPool.CheckpointAll(WalWriter);
+                    Console.WriteLine($"[WAL Recovery] Successfully replayed {replayedCount} committed mutation records up to LSN {checkpointLsn}.");
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[WAL Recovery] Error during recovery: {ex.Message}");
             }
         }
 
@@ -224,6 +387,8 @@ namespace Glacier.Sql.Catalog
             };
             _tables[tableName] = meta;
             Save();
+            TableStorage.InitializeTable(meta.BackingFile, columns);
+            BufferPool.GetOrLoad(meta);
         }
 
         public void RemoveTable(string tableName)
@@ -231,6 +396,7 @@ namespace Glacier.Sql.Catalog
             if (_tables.TryGetValue(tableName, out var meta))
             {
                 _tables.Remove(tableName);
+                BufferPool.Invalidate(tableName);
 
                 // Clean up any triggers associated with this table
                 var triggersToRemove = new List<string>();
@@ -340,6 +506,20 @@ namespace Glacier.Sql.Catalog
                     _tableLocks[tableName] = lk;
                 }
                 return lk;
+            }
+        }
+
+        public void Checkpoint()
+        {
+            BufferPool.CheckpointAll(WalWriter);
+        }
+
+        public void Dispose()
+        {
+            _walWriter?.Dispose();
+            if (_ownsBufferPool)
+            {
+                BufferPool.Dispose();
             }
         }
     }

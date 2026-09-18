@@ -2,11 +2,14 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Text;
 using System.Threading.Tasks;
 using Glacier.Polaris;
 using Glacier.Polaris.Data;
 using Glacier.Sql.Catalog;
 using Glacier.Sql.Parser;
+using Glacier.Sql.Storage.BufferPool;
+using Glacier.Sql.Storage.Wal;
 
 namespace Glacier.Sql.Engine
 {
@@ -51,6 +54,10 @@ namespace Glacier.Sql.Engine
         private readonly List<Action> _rollbacks = new();
         private readonly List<string> _backupFiles = new();
         private readonly List<TransactionLockInfo> _heldLocks = new();
+        private readonly HashSet<string> _backedUpTables = new(StringComparer.OrdinalIgnoreCase);
+
+        public bool HasBackedUpTable(string tableName) => _backedUpTables.Contains(tableName);
+        public void RegisterBackedUpTable(string tableName) => _backedUpTables.Add(tableName);
 
         public void RegisterRollback(Action action)
         {
@@ -216,11 +223,18 @@ namespace Glacier.Sql.Engine
     public class SqlEngine
     {
         private readonly QueryPlanner _planner;
+        private readonly CatalogManager _catalog;
+
+        public CatalogManager Catalog => _catalog;
 
         public SqlEngine(CatalogManager catalog)
         {
+            _catalog = catalog ?? throw new ArgumentNullException(nameof(catalog));
             _planner = new QueryPlanner(catalog);
         }
+
+        public void Checkpoint() => _catalog.Checkpoint();
+        public Task CheckpointAsync() => Task.Run(() => _catalog.Checkpoint());
 
         public async Task<ExecuteResult> ExecuteAsync(string sqlText, ExecutionContext context)
         {
@@ -231,7 +245,7 @@ namespace Glacier.Sql.Engine
                 var parser = new TSqlParser(tokens);
                 var stmt = parser.Parse();
 
-                return await ExecuteStatementAsync(stmt, context);
+                return await ExecuteStatementAsync(stmt, context, sqlText: sqlText);
             }
             catch (Exception ex)
             {
@@ -239,7 +253,7 @@ namespace Glacier.Sql.Engine
             }
         }
 
-        public async Task<ExecuteResult> ExecuteStatementAsync(SqlStatement stmt, ExecutionContext context, DataFrame? inserted = null, DataFrame? deleted = null)
+        public async Task<ExecuteResult> ExecuteStatementAsync(SqlStatement stmt, ExecutionContext context, DataFrame? inserted = null, DataFrame? deleted = null, string? sqlText = null)
         {
             try
             {
@@ -267,10 +281,10 @@ namespace Glacier.Sql.Engine
                         return await ExecuteSelect(select, context, inserted, deleted);
 
                     case DeleteStatement delete:
-                        return await ExecuteDelete(delete, context);
+                        return await ExecuteDelete(delete, context, sqlText);
 
                     case UpdateStatement update:
-                        return await ExecuteUpdate(update, context);
+                        return await ExecuteUpdate(update, context, sqlText);
 
                     case BeginTransactionStatement begin:
                         return ExecuteBeginTransaction(begin, context);
@@ -344,8 +358,8 @@ namespace Glacier.Sql.Engine
                 return ExecuteResult.Error($"Table '{insert.TableName}' does not exist.");
             }
 
-            // Load existing table data
-            var df = TableStorage.ReadTable(meta.BackingFile);
+            // Load existing table data via buffer pool
+            var bufferEntry = catalog.BufferPool.GetOrLoad(meta);
 
             // Parse and map insert values
             int targetColCount = insert.Columns?.Count ?? meta.Columns.Count;
@@ -425,16 +439,28 @@ namespace Glacier.Sql.Engine
 
             using (AcquireLock(insert.TableName, true, context))
             {
-                // Transaction rollback backup support
-                BackupForTransaction(meta, catalog, context);
+                // Transaction rollback in-memory snapshot support
+                BackupForTransaction(meta, catalog, context, bufferEntry);
 
-                // Concatenate
-                var mergedDf = DataFrame.Concat(new[] { df, newRowDf });
+                var currentDf = bufferEntry.CurrentSnapshot;
+
+                // Concatenate in memory
+                var mergedDf = DataFrame.Concat(new[] { currentDf, newRowDf });
 
                 // Validate constraints
                 await ValidateConstraintsAsync(meta, mergedDf, context);
 
-                TableStorage.WriteTable(mergedDf, meta.BackingFile);
+                // Update in-memory Buffer Pool and append to WAL
+                using (bufferEntry.AcquireWriteLock())
+                {
+                    bufferEntry.CurrentSnapshot = mergedDf;
+                    bufferEntry.IsDirty = true;
+
+                    byte[] payload = TableStorage.SerializeDataFrame(newRowDf);
+                    Guid txId = context.ActiveTransaction != null ? Guid.Parse(context.ActiveTransaction.TransactionId) : Guid.Empty;
+                    ulong lsn = catalog.WalWriter.AppendRecord(WalRecordType.RowInsert, txId, insert.TableName, payload);
+                    bufferEntry.LastAppliedLsn = lsn;
+                }
 
                 // Dispatch AFTER insert triggers
                 await RunTriggersAsync(insert.TableName, "INSERT", "AFTER", newRowDf, null, context);
@@ -458,7 +484,7 @@ namespace Glacier.Sql.Engine
             }
         }
 
-        private async Task<ExecuteResult> ExecuteDelete(DeleteStatement delete, ExecutionContext context)
+        private async Task<ExecuteResult> ExecuteDelete(DeleteStatement delete, ExecutionContext context, string? sqlText = null)
         {
             var catalog = context.Catalog;
             var meta = catalog.GetTable(delete.TableName);
@@ -467,7 +493,8 @@ namespace Glacier.Sql.Engine
                 return ExecuteResult.Error($"Table '{delete.TableName}' does not exist.");
             }
 
-            var df = TableStorage.ReadTable(meta.BackingFile);
+            var bufferEntry = catalog.BufferPool.GetOrLoad(meta);
+            var df = bufferEntry.CurrentSnapshot;
             int originalRowCount = df.RowCount;
 
             if (originalRowCount == 0)
@@ -518,11 +545,21 @@ namespace Glacier.Sql.Engine
 
             using (AcquireLock(delete.TableName, true, context))
             {
-                // Transaction rollback backup support
-                BackupForTransaction(meta, catalog, context);
+                // Transaction rollback in-memory snapshot support
+                BackupForTransaction(meta, catalog, context, bufferEntry);
 
-                // Write back to storage
-                TableStorage.WriteTable(filteredDf, meta.BackingFile);
+                // Update in-memory buffer pool and append to WAL
+                using (bufferEntry.AcquireWriteLock())
+                {
+                    bufferEntry.CurrentSnapshot = filteredDf;
+                    bufferEntry.IsDirty = true;
+
+                    string delText = sqlText ?? (delete.Where != null ? $"DELETE FROM {delete.TableName} WHERE {delete.Where}" : $"DELETE FROM {delete.TableName}");
+                    byte[] payload = Encoding.UTF8.GetBytes(delText);
+                    Guid txId = context.ActiveTransaction != null ? Guid.Parse(context.ActiveTransaction.TransactionId) : Guid.Empty;
+                    ulong lsn = catalog.WalWriter.AppendRecord(WalRecordType.RowDelete, txId, delete.TableName, payload);
+                    bufferEntry.LastAppliedLsn = lsn;
+                }
 
                 // Dispatch AFTER delete triggers
                 await RunTriggersAsync(delete.TableName, "DELETE", "AFTER", null, deletedRowsDf, context);
@@ -531,7 +568,7 @@ namespace Glacier.Sql.Engine
             }
         }
 
-        private async Task<ExecuteResult> ExecuteUpdate(UpdateStatement update, ExecutionContext context)
+        private async Task<ExecuteResult> ExecuteUpdate(UpdateStatement update, ExecutionContext context, string? sqlText = null)
         {
             var catalog = context.Catalog;
             var meta = catalog.GetTable(update.TableName);
@@ -540,7 +577,8 @@ namespace Glacier.Sql.Engine
                 return ExecuteResult.Error($"Table '{update.TableName}' does not exist.");
             }
 
-            var df = TableStorage.ReadTable(meta.BackingFile);
+            var bufferEntry = catalog.BufferPool.GetOrLoad(meta);
+            var df = bufferEntry.CurrentSnapshot;
             int originalRowCount = df.RowCount;
 
             if (originalRowCount == 0)
@@ -598,11 +636,21 @@ namespace Glacier.Sql.Engine
 
             using (AcquireLock(update.TableName, true, context))
             {
-                // Transaction rollback backup support
-                BackupForTransaction(meta, catalog, context);
+                // Transaction rollback in-memory snapshot support
+                BackupForTransaction(meta, catalog, context, bufferEntry);
 
-                // Save back to table storage
-                TableStorage.WriteTable(updatedDf, meta.BackingFile);
+                // Update in-memory buffer pool and append to WAL
+                using (bufferEntry.AcquireWriteLock())
+                {
+                    bufferEntry.CurrentSnapshot = updatedDf;
+                    bufferEntry.IsDirty = true;
+
+                    string updText = sqlText ?? $"UPDATE {update.TableName}";
+                    byte[] payload = Encoding.UTF8.GetBytes(updText);
+                    Guid txId = context.ActiveTransaction != null ? Guid.Parse(context.ActiveTransaction.TransactionId) : Guid.Empty;
+                    ulong lsn = catalog.WalWriter.AppendRecord(WalRecordType.RowUpdate, txId, update.TableName, payload);
+                    bufferEntry.LastAppliedLsn = lsn;
+                }
 
                 // Dispatch AFTER update triggers
                 await RunTriggersAsync(update.TableName, "UPDATE", "AFTER", insertedRowsDf, deletedRowsDf, context);
@@ -611,16 +659,37 @@ namespace Glacier.Sql.Engine
             }
         }
 
-        private void BackupForTransaction(TableMetadata meta, CatalogManager catalog, ExecutionContext context)
+        private void BackupForTransaction(TableMetadata meta, CatalogManager catalog, ExecutionContext context, TableBufferEntry? bufferEntry = null)
         {
-            if (context.ActiveTransaction != null)
+            if (context.ActiveTransaction != null && !context.ActiveTransaction.HasBackedUpTable(meta.TableName))
             {
+                context.ActiveTransaction.RegisterBackedUpTable(meta.TableName);
+
+                var entry = bufferEntry ?? catalog.BufferPool.GetOrLoad(meta);
+                var preTxSnapshot = entry.CurrentSnapshot;
+                context.ActiveTransaction.RegisterRollback(() =>
+                {
+                    using (entry.AcquireWriteLock())
+                    {
+                        entry.CurrentSnapshot = preTxSnapshot;
+                    }
+                });
+
+                // Fallback for legacy on-disk backup recovery test compatibility
                 string backupPath = Path.Combine(catalog.DataDirectory, $"{meta.TableName}_backup.ipc");
                 try
                 {
                     if (!File.Exists(backupPath))
                     {
-                        File.Copy(meta.BackingFile, backupPath, true);
+                        if (File.Exists(meta.BackingFile))
+                        {
+                            File.Copy(meta.BackingFile, backupPath, true);
+                        }
+                        else
+                        {
+                            var emptyDf = TableStorage.CreateEmptyDataFrame(meta.Columns);
+                            emptyDf.WriteIpc(backupPath);
+                        }
                         context.ActiveTransaction.RegisterBackupFile(backupPath);
                         context.ActiveTransaction.RegisterRollback(() =>
                         {
@@ -643,6 +712,8 @@ namespace Glacier.Sql.Engine
                 return ExecuteResult.Error("A transaction is already active. Nested transactions are not supported.");
             }
             context.ActiveTransaction = new SqlTransaction();
+            Guid txId = Guid.Parse(context.ActiveTransaction.TransactionId);
+            context.Catalog.WalWriter.AppendRecord(WalRecordType.TxBegin, txId, string.Empty, ReadOnlySpan<byte>.Empty);
             return ExecuteResult.Ok("Transaction started.", 0);
         }
 
@@ -652,6 +723,8 @@ namespace Glacier.Sql.Engine
             {
                 return ExecuteResult.Error("No active transaction found to commit.");
             }
+            Guid txId = Guid.Parse(context.ActiveTransaction.TransactionId);
+            context.Catalog.WalWriter.AppendRecord(WalRecordType.TxCommit, txId, string.Empty, ReadOnlySpan<byte>.Empty);
             context.ActiveTransaction.Commit();
             context.ActiveTransaction = null;
             return ExecuteResult.Ok("Transaction committed.", 0);
@@ -663,6 +736,8 @@ namespace Glacier.Sql.Engine
             {
                 return ExecuteResult.Error("No active transaction found to rollback.");
             }
+            Guid txId = Guid.Parse(context.ActiveTransaction.TransactionId);
+            context.Catalog.WalWriter.AppendRecord(WalRecordType.TxAbort, txId, string.Empty, ReadOnlySpan<byte>.Empty);
             context.ActiveTransaction.Rollback();
             context.ActiveTransaction = null;
             return ExecuteResult.Ok("Transaction rolled back.", 0);
@@ -747,21 +822,33 @@ namespace Glacier.Sql.Engine
                 return ExecuteResult.Ok($"{newRowsDf.RowCount} row(s) inserted (handled by INSTEAD OF trigger).", newRowsDf.RowCount);
             }
 
-            // Load existing table data
-            var df = TableStorage.ReadTable(meta.BackingFile);
+            // Load existing table data via buffer pool
+            var bufferEntry = catalog.BufferPool.GetOrLoad(meta);
 
             using (AcquireLock(insertSelect.TableName, true, context))
             {
-                // Transaction rollback backup support
-                BackupForTransaction(meta, catalog, context);
+                // Transaction rollback in-memory snapshot support
+                BackupForTransaction(meta, catalog, context, bufferEntry);
 
-                // Concatenate
-                var mergedDf = DataFrame.Concat(new[] { df, newRowsDf });
+                var currentDf = bufferEntry.CurrentSnapshot;
+
+                // Concatenate in memory
+                var mergedDf = DataFrame.Concat(new[] { currentDf, newRowsDf });
 
                 // Validate constraints
                 await ValidateConstraintsAsync(meta, mergedDf, context);
 
-                TableStorage.WriteTable(mergedDf, meta.BackingFile);
+                // Update in-memory buffer pool and append to WAL
+                using (bufferEntry.AcquireWriteLock())
+                {
+                    bufferEntry.CurrentSnapshot = mergedDf;
+                    bufferEntry.IsDirty = true;
+
+                    byte[] payload = TableStorage.SerializeDataFrame(newRowsDf);
+                    Guid txId = context.ActiveTransaction != null ? Guid.Parse(context.ActiveTransaction.TransactionId) : Guid.Empty;
+                    ulong lsn = catalog.WalWriter.AppendRecord(WalRecordType.RowInsert, txId, insertSelect.TableName, payload);
+                    bufferEntry.LastAppliedLsn = lsn;
+                }
 
                 // Dispatch AFTER insert triggers
                 await RunTriggersAsync(insertSelect.TableName, "INSERT", "AFTER", newRowsDf, null, context);
@@ -1155,7 +1242,8 @@ namespace Glacier.Sql.Engine
 
             using (AcquireLock(alter.TableName, true, context))
             {
-                var df = TableStorage.ReadTable(meta.BackingFile);
+                var alterEntry = catalog.BufferPool.GetOrLoad(meta);
+                var df = alterEntry.CurrentSnapshot;
 
                 if (alter.AlterAction.Equals("ADD", StringComparison.OrdinalIgnoreCase))
                 {
@@ -1188,6 +1276,11 @@ namespace Glacier.Sql.Engine
                     var newDf = new DataFrame(newCols);
 
                     TableStorage.WriteTable(newDf, meta.BackingFile);
+                    using (alterEntry.AcquireWriteLock())
+                    {
+                        alterEntry.CurrentSnapshot = newDf;
+                        alterEntry.IsDirty = false;
+                    }
                     catalog.Save();
 
                     return ExecuteResult.Ok($"Column '{colDef.Name}' added to table '{alter.TableName}' successfully.");
@@ -1214,6 +1307,11 @@ namespace Glacier.Sql.Engine
                     var newDf = new DataFrame(newCols);
 
                     TableStorage.WriteTable(newDf, meta.BackingFile);
+                    using (alterEntry.AcquireWriteLock())
+                    {
+                        alterEntry.CurrentSnapshot = newDf;
+                        alterEntry.IsDirty = false;
+                    }
                     catalog.Save();
 
                     return ExecuteResult.Ok($"Column '{colName}' dropped from table '{alter.TableName}' successfully.");

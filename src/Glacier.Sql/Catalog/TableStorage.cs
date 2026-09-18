@@ -5,19 +5,23 @@ using Apache.Arrow;
 using Apache.Arrow.Ipc;
 using Glacier.Polaris;
 using Glacier.Polaris.Data;
+using Glacier.Sql.Storage.BufferPool;
 
 namespace Glacier.Sql.Catalog
 {
     public static class TableStorage
     {
-        public static DataFrame ReadTable(string filePath)
+        private static readonly TableBufferPool _globalPool = new();
+        public static TableBufferPool BufferPool => _globalPool;
+
+        public static DataFrame ReadFromFile(string filePath)
         {
             if (!File.Exists(filePath))
             {
                 throw new FileNotFoundException($"Table data file not found at: '{filePath}'");
             }
 
-            using var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read);
+            using var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
             using var reader = new ArrowFileReader(fs);
             var recordBatch = reader.ReadNextRecordBatch();
             if (recordBatch == null)
@@ -25,6 +29,27 @@ namespace Glacier.Sql.Catalog
                 return new DataFrame();
             }
             return DataFrame.FromArrowRecordBatch(recordBatch);
+        }
+
+        public static DataFrame ReadTable(string filePath)
+        {
+            if (_globalPool.TryGetByFile(filePath, out var cachedEntry) && cachedEntry != null)
+            {
+                using (cachedEntry.AcquireReadLock())
+                {
+                    return cachedEntry.CurrentSnapshot;
+                }
+            }
+
+            var df = ReadFromFile(filePath);
+            string tableName = Path.GetFileNameWithoutExtension(filePath);
+            var entry = _globalPool.GetOrLoad(tableName, filePath, () => df);
+            using (entry.AcquireWriteLock())
+            {
+                entry.CurrentSnapshot = df;
+                entry.IsDirty = false;
+            }
+            return df;
         }
 
         public static void WriteTable(DataFrame df, string filePath)
@@ -35,7 +60,57 @@ namespace Glacier.Sql.Catalog
                 Directory.CreateDirectory(dir);
             }
 
-            df.WriteIpc(filePath);
+            // Atomic temporary write + move
+            string tmpPath = filePath + ".tmp." + Guid.NewGuid().ToString("N");
+            try
+            {
+                df.WriteIpc(tmpPath);
+                File.Move(tmpPath, filePath, overwrite: true);
+            }
+            finally
+            {
+                if (File.Exists(tmpPath))
+                {
+                    try { File.Delete(tmpPath); } catch { }
+                }
+            }
+
+            // Sync with buffer pool
+            string tableName = Path.GetFileNameWithoutExtension(filePath);
+            var entry = _globalPool.GetOrLoad(tableName, filePath, () => df);
+            using (entry.AcquireWriteLock())
+            {
+                entry.CurrentSnapshot = df;
+                entry.IsDirty = false;
+            }
+        }
+
+        public static byte[] SerializeDataFrame(DataFrame df)
+        {
+            using var ms = new MemoryStream();
+            var recordBatch = df.ToArrowRecordBatch();
+            using (var writer = new ArrowStreamWriter(ms, recordBatch.Schema))
+            {
+                writer.WriteRecordBatch(recordBatch);
+            }
+            return ms.ToArray();
+        }
+
+        public static DataFrame DeserializeDataFrame(byte[] bytes)
+        {
+            if (bytes == null || bytes.Length == 0)
+            {
+                return new DataFrame();
+            }
+
+            using var ms = new MemoryStream(bytes);
+            using var reader = new ArrowStreamReader(ms);
+            var recordBatch = reader.ReadNextRecordBatch();
+            if (recordBatch == null)
+            {
+                return new DataFrame();
+            }
+            return DataFrame.FromArrowRecordBatch(recordBatch);
         }
 
         public static DataFrame CreateEmptyDataFrame(List<ColumnMetadata> columns)

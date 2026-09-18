@@ -139,7 +139,8 @@ namespace Glacier.Sql.Engine
                 {
                     throw new Exception($"Table '{source.TableName}' does not exist in catalog.");
                 }
-                var df = TableStorage.ReadTable(tableMeta.BackingFile);
+                var entry = _catalog.BufferPool.GetOrLoad(tableMeta);
+                var df = entry.CurrentSnapshot;
                 currentLazy = df.Lazy();
             }
 
@@ -260,7 +261,8 @@ namespace Glacier.Sql.Engine
                     {
                         throw new Exception($"Joined table '{joinSource.TableName}' does not exist in catalog.");
                     }
-                    var joinDf = TableStorage.ReadTable(joinTableMeta.BackingFile);
+                    var joinEntry = _catalog.BufferPool.GetOrLoad(joinTableMeta);
+                    var joinDf = joinEntry.CurrentSnapshot;
                     joinLazy = joinDf.Lazy();
                 }
 
