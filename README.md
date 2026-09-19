@@ -125,6 +125,14 @@ For a comprehensive guide covering all syntax, internal engine architecture, dat
 
 ---
 
+## 🆕 What's New in v1.0.4
+
+- **Write-Ahead Log (WAL) with idempotent crash recovery** — committed transactions are replayed atomically on restart after unexpected shutdown.
+- **Isolated `TableBufferPool` per `CatalogManager` instance** — eliminates global state contention enabling multiple independent catalog instances in the same process.
+- **35 tests** passing (100 %).
+
+---
+
 ## Credits
 
 Developed by Ian Cowley and Antigravity (Google DeepMind).
