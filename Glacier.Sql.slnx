@@ -2,4 +2,5 @@
   <Project Path="src/Glacier.Sql/Glacier.Sql.csproj" />
   <Project Path="src/Glacier.Sql.Host/Glacier.Sql.Host.csproj" />
   <Project Path="tests/Glacier.Sql.Tests/Glacier.Sql.Tests.csproj" />
+  <Project Path="benchmarks/Glacier.Sql.Benchmarks/Glacier.Sql.Benchmarks.csproj" />
 </Solution>

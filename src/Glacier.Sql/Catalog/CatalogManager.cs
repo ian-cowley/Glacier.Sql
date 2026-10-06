@@ -9,6 +9,7 @@ using Glacier.Sql.Engine;
 using Glacier.Sql.Parser;
 using Glacier.Sql.Storage.BufferPool;
 using Glacier.Sql.Storage.Wal;
+using Glacier.Sql.Diagnostics;
 
 namespace Glacier.Sql.Catalog
 {
@@ -147,7 +148,7 @@ namespace Glacier.Sql.Catalog
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Error loading catalog: {ex.Message}");
+                GlacierSqlDiagnostics.LogError($"Error loading catalog: {ex.Message}", ex);
             }
         }
 
@@ -174,11 +175,11 @@ namespace Glacier.Sql.Catalog
                             File.Delete(backupPath);
                             BufferPool.Invalidate(tableName);
                             TableStorage.BufferPool.Invalidate(tableName);
-                            Console.WriteLine($"[Recovery] Restored table '{tableName}' from transaction backup due to previous crash.");
+                            GlacierSqlDiagnostics.LogInformation($"[Recovery] Restored table '{tableName}' from transaction backup due to previous crash.");
                         }
                         catch (Exception ex)
                         {
-                            Console.WriteLine($"[Recovery] Failed to restore '{tableName}': {ex.Message}");
+                            GlacierSqlDiagnostics.LogError($"[Recovery] Failed to restore '{tableName}': {ex.Message}", ex);
                         }
                     }
                     else
@@ -190,7 +191,7 @@ namespace Glacier.Sql.Catalog
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Error recovering transaction backups: {ex.Message}");
+                GlacierSqlDiagnostics.LogError($"Error recovering transaction backups: {ex.Message}", ex);
             }
         }
 
@@ -329,12 +330,12 @@ namespace Glacier.Sql.Catalog
                 if (replayedCount > 0)
                 {
                     BufferPool.CheckpointAll(WalWriter);
-                    Console.WriteLine($"[WAL Recovery] Successfully replayed {replayedCount} committed mutation records up to LSN {checkpointLsn}.");
+                    GlacierSqlDiagnostics.LogInformation($"[WAL Recovery] Successfully replayed {replayedCount} committed mutation records up to LSN {checkpointLsn}.");
                 }
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[WAL Recovery] Error during recovery: {ex.Message}");
+                GlacierSqlDiagnostics.LogError($"[WAL Recovery] Error during recovery: {ex.Message}", ex);
             }
         }
 
@@ -358,7 +359,7 @@ namespace Glacier.Sql.Catalog
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Error saving catalog: {ex.Message}");
+                GlacierSqlDiagnostics.LogError($"Error saving catalog: {ex.Message}", ex);
             }
         }
 
