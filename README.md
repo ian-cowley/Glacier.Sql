@@ -125,6 +125,15 @@ For a comprehensive guide covering all syntax, internal engine architecture, dat
 
 ---
 
+## 🆕 What's New in v1.0.5
+
+- **Engine & Parser Modularization (<550 lines)** — Partitioned `SqlEngine.cs`, `QueryPlanner.cs`, and `TSqlParser.cs` into 10 cohesive partial classes with all files strictly under 550 lines.
+- **Zero Console Calls (`GlacierSqlDiagnostics`)** — Ambient logging subsystem replacing all legacy WAL and recovery `Console.WriteLine` calls in `CatalogManager.cs`.
+- **`Glacier.Sql.Benchmarks` Suite** — BenchmarkDotNet suite profiling SQL tokenization, AST generation, and query plan compilation.
+- **50 unit tests** passing (100% green).
+
+---
+
 ## 🆕 What's New in v1.0.4
 
 - **Write-Ahead Log (WAL) with idempotent crash recovery** — committed transactions are replayed atomically on restart after unexpected shutdown.
