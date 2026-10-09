@@ -1,8 +1,6 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
-using Apache.Arrow;
-using Apache.Arrow.Ipc;
 using Glacier.Polaris;
 using Glacier.Polaris.Data;
 using Glacier.Sql.Storage.BufferPool;
@@ -21,14 +19,7 @@ namespace Glacier.Sql.Catalog
                 throw new FileNotFoundException($"Table data file not found at: '{filePath}'");
             }
 
-            using var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
-            using var reader = new ArrowFileReader(fs);
-            var recordBatch = reader.ReadNextRecordBatch();
-            if (recordBatch == null)
-            {
-                return new DataFrame();
-            }
-            return DataFrame.FromArrowRecordBatch(recordBatch);
+            return DataFrame.FromArrowIpc(filePath);
         }
 
         public static DataFrame ReadTable(string filePath)
@@ -64,7 +55,7 @@ namespace Glacier.Sql.Catalog
             string tmpPath = filePath + ".tmp." + Guid.NewGuid().ToString("N");
             try
             {
-                df.WriteIpc(tmpPath);
+                df.ToArrowIpc(tmpPath);
                 File.Move(tmpPath, filePath, overwrite: true);
             }
             finally
@@ -88,11 +79,7 @@ namespace Glacier.Sql.Catalog
         public static byte[] SerializeDataFrame(DataFrame df)
         {
             using var ms = new MemoryStream();
-            var recordBatch = df.ToArrowRecordBatch();
-            using (var writer = new ArrowStreamWriter(ms, recordBatch.Schema))
-            {
-                writer.WriteRecordBatch(recordBatch);
-            }
+            df.ToArrowIpc(ms);
             return ms.ToArray();
         }
 
@@ -104,13 +91,7 @@ namespace Glacier.Sql.Catalog
             }
 
             using var ms = new MemoryStream(bytes);
-            using var reader = new ArrowStreamReader(ms);
-            var recordBatch = reader.ReadNextRecordBatch();
-            if (recordBatch == null)
-            {
-                return new DataFrame();
-            }
-            return DataFrame.FromArrowRecordBatch(recordBatch);
+            return DataFrame.FromArrowIpc(ms);
         }
 
         public static DataFrame CreateEmptyDataFrame(List<ColumnMetadata> columns)
