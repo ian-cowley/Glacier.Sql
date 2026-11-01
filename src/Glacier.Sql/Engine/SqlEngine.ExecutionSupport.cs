@@ -1,6 +1,6 @@
 using System;
 using System.Collections.Generic;
-using System.IO;
+using System.Globalization;
 using System.Linq;
 using System.Threading.Tasks;
 using Glacier.Polaris;
@@ -16,12 +16,21 @@ namespace Glacier.Sql.Engine
     {
         private void BackupForTransaction(TableMetadata meta, CatalogManager catalog, ExecutionContext context, TableBufferEntry? bufferEntry = null)
         {
-            if (context.ActiveTransaction != null && !context.ActiveTransaction.HasBackedUpTable(meta.TableName))
+            if (context.ActiveTransaction == null) return;
+
+            var entry = bufferEntry ?? catalog.BufferPool.GetOrLoad(meta);
+            context.ActiveTransaction.RegisterMutatedEntry(entry);
+
+            if (!context.ActiveTransaction.HasBackedUpTable(meta.TableName))
             {
                 context.ActiveTransaction.RegisterBackedUpTable(meta.TableName);
 
-                var entry = bufferEntry ?? catalog.BufferPool.GetOrLoad(meta);
-                var preTxSnapshot = entry.CurrentSnapshot;
+                DataFrame preTxSnapshot;
+                using (entry.AcquireReadLock())
+                {
+                    preTxSnapshot = entry.CurrentSnapshot;
+                }
+
                 context.ActiveTransaction.RegisterRollback(() =>
                 {
                     using (entry.AcquireWriteLock())
@@ -29,71 +38,46 @@ namespace Glacier.Sql.Engine
                         entry.CurrentSnapshot = preTxSnapshot;
                     }
                 });
-
-                // Fallback for legacy on-disk backup recovery test compatibility
-                string backupPath = Path.Combine(catalog.DataDirectory, $"{meta.TableName}_backup.ipc");
-                try
-                {
-                    if (!File.Exists(backupPath))
-                    {
-                        if (File.Exists(meta.BackingFile))
-                        {
-                            File.Copy(meta.BackingFile, backupPath, true);
-                        }
-                        else
-                        {
-                            var emptyDf = TableStorage.CreateEmptyDataFrame(meta.Columns);
-                            emptyDf.WriteIpc(backupPath);
-                        }
-                        context.ActiveTransaction.RegisterBackupFile(backupPath);
-                        context.ActiveTransaction.RegisterRollback(() =>
-                        {
-                            if (File.Exists(backupPath))
-                            {
-                                File.Copy(backupPath, meta.BackingFile, true);
-                                File.Delete(backupPath);
-                            }
-                        });
-                    }
-                }
-                catch { }
             }
         }
 
         private ExecuteResult ExecuteBeginTransaction(BeginTransactionStatement begin, ExecutionContext context)
         {
+            _ = begin;
             if (context.ActiveTransaction != null)
             {
                 return ExecuteResult.Error("A transaction is already active. Nested transactions are not supported.");
             }
-            context.ActiveTransaction = new SqlTransaction();
-            Guid txId = Guid.Parse(context.ActiveTransaction.TransactionId);
-            context.Catalog.WalWriter.AppendRecord(WalRecordType.TxBegin, txId, string.Empty, ReadOnlySpan<byte>.Empty);
+            var tx = new SqlTransaction();
+            context.ActiveTransaction = tx;
+            context.Catalog.WalWriter.AppendRecord(WalRecordType.TxBegin, tx.TransactionGuid, string.Empty, ReadOnlySpan<byte>.Empty);
             return ExecuteResult.Ok("Transaction started.", 0);
         }
 
         private ExecuteResult ExecuteCommitTransaction(CommitTransactionStatement commit, ExecutionContext context)
         {
+            _ = commit;
             if (context.ActiveTransaction == null)
             {
                 return ExecuteResult.Error("No active transaction found to commit.");
             }
-            Guid txId = Guid.Parse(context.ActiveTransaction.TransactionId);
-            context.Catalog.WalWriter.AppendRecord(WalRecordType.TxCommit, txId, string.Empty, ReadOnlySpan<byte>.Empty);
-            context.ActiveTransaction.Commit();
+            var tx = context.ActiveTransaction;
+            ulong commitLsn = context.Catalog.WalWriter.AppendRecord(WalRecordType.TxCommit, tx.TransactionGuid, string.Empty, ReadOnlySpan<byte>.Empty);
+            tx.Commit(commitLsn);
             context.ActiveTransaction = null;
             return ExecuteResult.Ok("Transaction committed.", 0);
         }
 
         private ExecuteResult ExecuteRollbackTransaction(RollbackTransactionStatement rollback, ExecutionContext context)
         {
+            _ = rollback;
             if (context.ActiveTransaction == null)
             {
                 return ExecuteResult.Error("No active transaction found to rollback.");
             }
-            Guid txId = Guid.Parse(context.ActiveTransaction.TransactionId);
-            context.Catalog.WalWriter.AppendRecord(WalRecordType.TxAbort, txId, string.Empty, ReadOnlySpan<byte>.Empty);
-            context.ActiveTransaction.Rollback();
+            var tx = context.ActiveTransaction;
+            context.Catalog.WalWriter.AppendRecord(WalRecordType.TxAbort, tx.TransactionGuid, string.Empty, ReadOnlySpan<byte>.Empty);
+            tx.Rollback();
             context.ActiveTransaction = null;
             return ExecuteResult.Ok("Transaction rolled back.", 0);
         }
@@ -157,7 +141,7 @@ namespace Glacier.Sql.Engine
         private bool HasInsteadOfTrigger(string tableName, string eventType, ExecutionContext context)
         {
             var persistentTriggers = context.Catalog.GetTriggersForTable(tableName, eventType);
-            return persistentTriggers.Any(t => t.Timing.Equals("INSTEAD OF", StringComparison.OrdinalIgnoreCase) && 
+            return persistentTriggers.Any(t => t.Timing.Equals("INSTEAD OF", StringComparison.OrdinalIgnoreCase) &&
                                                t.EventType.Equals(eventType, StringComparison.OrdinalIgnoreCase));
         }
 
@@ -178,7 +162,9 @@ namespace Glacier.Sql.Engine
             }
             if (dt == "VARCHAR" || dt == "TEXT" || dt == "CHAR")
             {
-                var s = new Utf8StringSeries(name, new string[length]);
+                var emptyStrings = new string[length];
+                Array.Fill(emptyStrings, string.Empty);
+                var s = new Utf8StringSeries(name, emptyStrings);
                 for (int i = 0; i < length; i++) s.ValidityMask.SetNull(i);
                 return s;
             }
@@ -318,30 +304,31 @@ namespace Glacier.Sql.Engine
             {
                 if (dt == "INT" || dt == "INTEGER")
                 {
-                    return Convert.ToInt32(val);
+                    return Convert.ToInt32(val, CultureInfo.InvariantCulture);
                 }
                 if (dt == "FLOAT" || dt == "DOUBLE" || dt == "REAL")
                 {
-                    return Convert.ToDouble(val);
+                    return Convert.ToDouble(val, CultureInfo.InvariantCulture);
                 }
                 if (dt == "VARCHAR" || dt == "TEXT" || dt == "CHAR")
                 {
-                    return val.ToString();
+                    return Convert.ToString(val, CultureInfo.InvariantCulture);
                 }
                 if (dt == "BIT" || dt == "BOOLEAN")
                 {
                     if (val is bool b) return b;
                     if (val is int i) return i != 0;
+                    if (val is long l) return l != 0L;
                     if (val is string s) return s.Equals("true", StringComparison.OrdinalIgnoreCase) || s == "1";
-                    return Convert.ToBoolean(val);
+                    return Convert.ToBoolean(val, CultureInfo.InvariantCulture);
                 }
                 if (dt == "DATETIME" || dt == "DATE")
                 {
                     if (val is string sDate)
                     {
-                        return DateTimeOffset.Parse(sDate).ToUnixTimeMilliseconds();
+                        return DateTimeOffset.Parse(sDate, CultureInfo.InvariantCulture).ToUnixTimeMilliseconds();
                     }
-                    return Convert.ToInt64(val);
+                    return Convert.ToInt64(val, CultureInfo.InvariantCulture);
                 }
             }
             catch (Exception ex)
@@ -352,17 +339,24 @@ namespace Glacier.Sql.Engine
             return val;
         }
 
-        // Lock & Constraint Helpers
-        private IDatabaseLock AcquireLock(string tableName, bool exclusive, ExecutionContext context)
+        // Async Lock & Table Dependency Helpers
+        private static bool IsVirtualOrSystemTable(string tableName)
         {
-            if (tableName.Equals("inserted", StringComparison.OrdinalIgnoreCase) ||
-                tableName.Equals("deleted", StringComparison.OrdinalIgnoreCase) ||
-                tableName.StartsWith("INFORMATION_SCHEMA", StringComparison.OrdinalIgnoreCase))
+            return string.IsNullOrEmpty(tableName) ||
+                   tableName.Equals("inserted", StringComparison.OrdinalIgnoreCase) ||
+                   tableName.Equals("deleted", StringComparison.OrdinalIgnoreCase) ||
+                   tableName.StartsWith("INFORMATION_SCHEMA", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private async ValueTask<IDatabaseLock> AcquireLockAsync(string tableName, bool exclusive, ExecutionContext context)
+        {
+            if (IsVirtualOrSystemTable(tableName))
             {
-                return new NullDatabaseLock();
+                return NullDatabaseLock.Instance;
             }
 
             var lk = context.Catalog.GetTableLock(tableName);
+
             if (context.ActiveTransaction != null)
             {
                 var existing = context.ActiveTransaction.GetHeldLock(tableName);
@@ -370,73 +364,292 @@ namespace Glacier.Sql.Engine
                 {
                     if (existing.Exclusive || !exclusive)
                     {
-                        return new NullDatabaseLock();
+                        return NullDatabaseLock.Instance;
+                    }
+
+                    // Deadlock-safe async read-to-write upgrade
+                    var writeReleaser = await lk.UpgradeReadToWriteAsync(existing.Releaser).ConfigureAwait(false);
+                    existing.UpgradeToWrite(writeReleaser);
+                    return NullDatabaseLock.Instance;
+                }
+
+                var releaser = exclusive
+                    ? await lk.EnterWriteLockAsync().ConfigureAwait(false)
+                    : await lk.EnterReadLockAsync().ConfigureAwait(false);
+
+                context.ActiveTransaction.RegisterLock(tableName, exclusive, lk, releaser);
+                return NullDatabaseLock.Instance;
+            }
+
+            // Re-entrant statement lock tracking (supports nested AFTER / INSTEAD OF triggers on the same ExecutionContext)
+            AsyncReaderWriterLock.LockReleaser? existingReadToUpgrade = null;
+            lock (context.StatementLockSync)
+            {
+                if (context.StatementLocks.TryGetValue(tableName, out var state))
+                {
+                    if (state.Exclusive || !exclusive)
+                    {
+                        state.RefCount++;
+                        return new DatabaseLock(() => ReleaseStatementLock(context, tableName));
+                    }
+
+                    existingReadToUpgrade = state.Releaser;
+                }
+            }
+
+            if (existingReadToUpgrade != null)
+            {
+                var upgradedReleaser = await lk.UpgradeReadToWriteAsync(existingReadToUpgrade).ConfigureAwait(false);
+                lock (context.StatementLockSync)
+                {
+                    if (context.StatementLocks.TryGetValue(tableName, out var state))
+                    {
+                        state.Releaser = upgradedReleaser;
+                        state.Exclusive = true;
+                        state.RefCount++;
                     }
                     else
                     {
-                        // Upgrade lock
-                        if (existing.Lock.IsReadLockHeld)
-                            existing.Lock.ExitReadLock();
-                        context.ActiveTransaction.RemoveHeldLock(tableName);
+                        context.StatementLocks[tableName] = new StatementLockState(tableName, lk, upgradedReleaser, exclusive: true);
                     }
                 }
+                return new DatabaseLock(() => ReleaseStatementLock(context, tableName));
+            }
 
-                if (exclusive)
-                    lk.EnterWriteLock();
-                else
-                    lk.EnterReadLock();
+            var stmtReleaser = exclusive
+                ? await lk.EnterWriteLockAsync().ConfigureAwait(false)
+                : await lk.EnterReadLockAsync().ConfigureAwait(false);
 
-                context.ActiveTransaction.RegisterLock(tableName, exclusive, lk);
-                return new NullDatabaseLock();
+            lock (context.StatementLockSync)
+            {
+                context.StatementLocks[tableName] = new StatementLockState(tableName, lk, stmtReleaser, exclusive);
+            }
+
+            return new DatabaseLock(() => ReleaseStatementLock(context, tableName));
+        }
+
+        private static void ReleaseStatementLock(ExecutionContext context, string tableName)
+        {
+            AsyncReaderWriterLock.LockReleaser? releaserToDispose = null;
+            lock (context.StatementLockSync)
+            {
+                if (context.StatementLocks.TryGetValue(tableName, out var state))
+                {
+                    state.RefCount--;
+                    if (state.RefCount <= 0)
+                    {
+                        context.StatementLocks.Remove(tableName);
+                        releaserToDispose = state.Releaser;
+                    }
+                }
+            }
+
+            releaserToDispose?.Dispose();
+        }
+
+        private async ValueTask<IDatabaseLock> AcquireTableLocksAsync(
+            Dictionary<string, bool> lockRequests,
+            ExecutionContext context)
+        {
+            if (lockRequests.Count == 0)
+            {
+                return NullDatabaseLock.Instance;
+            }
+
+            // Canonical alphabetical ordering prevents multi-table AB/BA deadlocks
+            var ordered = lockRequests
+                .Where(kvp => !IsVirtualOrSystemTable(kvp.Key))
+                .OrderBy(kvp => kvp.Key, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            if (ordered.Count == 0)
+            {
+                return NullDatabaseLock.Instance;
+            }
+
+            if (ordered.Count == 1)
+            {
+                return await AcquireLockAsync(ordered[0].Key, ordered[0].Value, context).ConfigureAwait(false);
+            }
+
+            var acquired = new List<IDatabaseLock>(ordered.Count);
+            try
+            {
+                foreach (var kvp in ordered)
+                {
+                    acquired.Add(await AcquireLockAsync(kvp.Key, kvp.Value, context).ConfigureAwait(false));
+                }
+
+                return new DatabaseLock(() =>
+                {
+                    for (int i = acquired.Count - 1; i >= 0; i--)
+                    {
+                        try { acquired[i].Dispose(); } catch { }
+                    }
+                });
+            }
+            catch
+            {
+                for (int i = acquired.Count - 1; i >= 0; i--)
+                {
+                    try { acquired[i].Dispose(); } catch { }
+                }
+                throw;
+            }
+        }
+
+        private static void AddLockRequest(Dictionary<string, bool> lockRequests, string tableName, bool exclusive)
+        {
+            if (IsVirtualOrSystemTable(tableName)) return;
+
+            if (lockRequests.TryGetValue(tableName, out bool existingExclusive))
+            {
+                if (exclusive && !existingExclusive)
+                {
+                    lockRequests[tableName] = true;
+                }
             }
             else
             {
-                return new DatabaseLock(lk, exclusive);
+                lockRequests[tableName] = exclusive;
             }
         }
 
-        private List<IDatabaseLock> AcquireSelectLocks(SelectStatement select, bool exclusive, ExecutionContext context)
+        private static void CollectTableOrViewLockRequests(
+            string name,
+            CatalogManager catalog,
+            Dictionary<string, bool> lockRequests,
+            bool exclusive,
+            HashSet<string>? visitedViews = null)
         {
-            var locks = new List<IDatabaseLock>();
-            var tables = GetSelectTables(select);
-            foreach (var t in tables)
+            if (IsVirtualOrSystemTable(name)) return;
+
+            if (catalog.ViewExists(name))
             {
-                if (context.Catalog.ViewExists(t))
+                visitedViews ??= new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                if (!visitedViews.Add(name))
                 {
-                    var viewMeta = context.Catalog.GetView(t)!;
+                    return;
+                }
+
+                var viewMeta = catalog.GetView(name);
+                if (viewMeta != null)
+                {
                     var lexer = new SqlLexer(viewMeta.DefinitionSql);
                     var tokens = lexer.Tokenize();
                     var parser = new TSqlParser(tokens);
-                    var viewSelect = (SelectStatement)parser.Parse();
-                    locks.AddRange(AcquireSelectLocks(viewSelect, exclusive, context));
-                }
-                else
-                {
-                    locks.Add(AcquireLock(t, exclusive, context));
+                    if (parser.Parse() is SelectStatement viewSelect)
+                    {
+                        CollectSelectLockRequests(viewSelect, catalog, lockRequests, exclusive, visitedViews);
+                    }
                 }
             }
-            return locks;
+            else
+            {
+                AddLockRequest(lockRequests, name, exclusive);
+            }
         }
 
-        private List<string> GetSelectTables(SelectStatement select)
+        private static void CollectSelectLockRequests(
+            SelectStatement select,
+            CatalogManager catalog,
+            Dictionary<string, bool> lockRequests,
+            bool exclusive,
+            HashSet<string>? visitedViews = null)
         {
-            var tables = new List<string>();
             if (select.From is SqlTableSource source)
             {
-                tables.Add(source.TableName);
+                CollectTableOrViewLockRequests(source.TableName, catalog, lockRequests, exclusive, visitedViews);
             }
+
             foreach (var join in select.Joins)
             {
                 if (join.Table is SqlTableSource joinSource)
                 {
-                    tables.Add(joinSource.TableName);
+                    CollectTableOrViewLockRequests(joinSource.TableName, catalog, lockRequests, exclusive, visitedViews);
+                }
+                if (join.On != null)
+                {
+                    CollectExpressionLockRequests(join.On, catalog, lockRequests, visitedViews);
                 }
             }
-            return tables;
+
+            foreach (var proj in select.Projections)
+            {
+                CollectExpressionLockRequests(proj.Expression, catalog, lockRequests, visitedViews);
+            }
+
+            if (select.Where != null)
+            {
+                CollectExpressionLockRequests(select.Where, catalog, lockRequests, visitedViews);
+            }
+
+            foreach (var grp in select.GroupBy)
+            {
+                CollectExpressionLockRequests(grp, catalog, lockRequests, visitedViews);
+            }
+
+            if (select.Having != null)
+            {
+                CollectExpressionLockRequests(select.Having, catalog, lockRequests, visitedViews);
+            }
+
+            foreach (var ord in select.OrderBy)
+            {
+                CollectExpressionLockRequests(ord.Expression, catalog, lockRequests, visitedViews);
+            }
+        }
+
+        private static void CollectExpressionLockRequests(
+            SqlExpression expr,
+            CatalogManager catalog,
+            Dictionary<string, bool> lockRequests,
+            HashSet<string>? visitedViews = null)
+        {
+            switch (expr)
+            {
+                case SqlSubqueryExpression sub:
+                    CollectSelectLockRequests(sub.SelectQuery, catalog, lockRequests, exclusive: false, visitedViews);
+                    break;
+
+                case SqlExistsExpression exists:
+                    CollectSelectLockRequests(exists.SelectQuery, catalog, lockRequests, exclusive: false, visitedViews);
+                    break;
+
+                case SqlInSubqueryExpression inSub:
+                    CollectExpressionLockRequests(inSub.Left, catalog, lockRequests, visitedViews);
+                    CollectSelectLockRequests(inSub.Subquery, catalog, lockRequests, exclusive: false, visitedViews);
+                    break;
+
+                case SqlInListExpression inList:
+                    CollectExpressionLockRequests(inList.Left, catalog, lockRequests, visitedViews);
+                    foreach (var item in inList.List)
+                    {
+                        CollectExpressionLockRequests(item, catalog, lockRequests, visitedViews);
+                    }
+                    break;
+
+                case SqlBinaryExpression bin:
+                    CollectExpressionLockRequests(bin.Left, catalog, lockRequests, visitedViews);
+                    CollectExpressionLockRequests(bin.Right, catalog, lockRequests, visitedViews);
+                    break;
+
+                case SqlUnaryExpression unary:
+                    CollectExpressionLockRequests(unary.Operand, catalog, lockRequests, visitedViews);
+                    break;
+
+                case SqlFunctionCall fn:
+                    foreach (var arg in fn.Arguments)
+                    {
+                        CollectExpressionLockRequests(arg, catalog, lockRequests, visitedViews);
+                    }
+                    break;
+            }
         }
 
         private async Task ValidateConstraintsAsync(TableMetadata meta, DataFrame df, ExecutionContext context)
         {
+            _ = context;
             foreach (var col in meta.Columns)
             {
                 var series = df.Columns.FirstOrDefault(c => c.Name.Equals(col.Name, StringComparison.OrdinalIgnoreCase));

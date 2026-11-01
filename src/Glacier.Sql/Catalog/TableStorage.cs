@@ -9,9 +9,6 @@ namespace Glacier.Sql.Catalog
 {
     public static class TableStorage
     {
-        private static readonly TableBufferPool _globalPool = new();
-        public static TableBufferPool BufferPool => _globalPool;
-
         public static DataFrame ReadFromFile(string filePath)
         {
             if (!File.Exists(filePath))
@@ -22,9 +19,9 @@ namespace Glacier.Sql.Catalog
             return DataFrame.FromArrowIpc(filePath);
         }
 
-        public static DataFrame ReadTable(string filePath)
+        public static DataFrame ReadTable(string filePath, TableBufferPool? bufferPool = null)
         {
-            if (_globalPool.TryGetByFile(filePath, out var cachedEntry) && cachedEntry != null)
+            if (bufferPool != null && bufferPool.TryGetByFile(filePath, out var cachedEntry) && cachedEntry != null)
             {
                 using (cachedEntry.AcquireReadLock())
                 {
@@ -32,18 +29,10 @@ namespace Glacier.Sql.Catalog
                 }
             }
 
-            var df = ReadFromFile(filePath);
-            string tableName = Path.GetFileNameWithoutExtension(filePath);
-            var entry = _globalPool.GetOrLoad(tableName, filePath, () => df);
-            using (entry.AcquireWriteLock())
-            {
-                entry.CurrentSnapshot = df;
-                entry.IsDirty = false;
-            }
-            return df;
+            return ReadFromFile(filePath);
         }
 
-        public static void WriteTable(DataFrame df, string filePath)
+        public static void WriteTable(DataFrame df, string filePath, TableBufferPool? bufferPool = null)
         {
             string? dir = Path.GetDirectoryName(filePath);
             if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
@@ -51,7 +40,6 @@ namespace Glacier.Sql.Catalog
                 Directory.CreateDirectory(dir);
             }
 
-            // Atomic temporary write + move
             string tmpPath = filePath + ".tmp." + Guid.NewGuid().ToString("N");
             try
             {
@@ -66,13 +54,18 @@ namespace Glacier.Sql.Catalog
                 }
             }
 
-            // Sync with buffer pool
-            string tableName = Path.GetFileNameWithoutExtension(filePath);
-            var entry = _globalPool.GetOrLoad(tableName, filePath, () => df);
-            using (entry.AcquireWriteLock())
+            if (bufferPool != null)
             {
-                entry.CurrentSnapshot = df;
-                entry.IsDirty = false;
+                string tableName = Path.GetFileNameWithoutExtension(filePath);
+                var entry = bufferPool.GetOrLoad(tableName, filePath, () => df);
+                using (entry.AcquireWriteLock())
+                {
+                    entry.CurrentSnapshot = df;
+                    entry.CommittedSnapshot = df;
+                    entry.HasUnflushedCommittedChanges = false;
+                    entry.FirstUnflushedLsn = 0;
+                    entry.IsDirty = false;
+                }
             }
         }
 
@@ -128,10 +121,10 @@ namespace Glacier.Sql.Catalog
             return new DataFrame(seriesList);
         }
 
-        public static void InitializeTable(string filePath, List<ColumnMetadata> columns)
+        public static void InitializeTable(string filePath, List<ColumnMetadata> columns, TableBufferPool? bufferPool = null)
         {
             var df = CreateEmptyDataFrame(columns);
-            WriteTable(df, filePath);
+            WriteTable(df, filePath, bufferPool);
         }
     }
 }

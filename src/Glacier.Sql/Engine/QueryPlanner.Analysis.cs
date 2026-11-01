@@ -60,7 +60,8 @@ namespace Glacier.Sql.Engine
             if (className.Contains("Int32") || type == typeof(int)) return "INT";
             if (className.Contains("Float64") || className.Contains("Double") || type == typeof(double)) return "FLOAT";
             if (className.Contains("Boolean") || className.Contains("Bool") || type == typeof(bool)) return "BIT";
-            if (className.Contains("Time") || className.Contains("Date") || className.Contains("DateTime") || type == typeof(long)) return "DATETIME";
+            if (className.Contains("Time") || className.Contains("Date") || className.Contains("DateTime")) return "DATETIME";
+            if (className.Contains("Int64") || type == typeof(long)) return "INT";
             return "VARCHAR";
         }
 

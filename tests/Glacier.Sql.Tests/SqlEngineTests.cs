@@ -448,45 +448,46 @@ namespace Glacier.Sql.Tests
         [Fact]
         public async Task TestCrashRecovery()
         {
-            // Setup a table with some data
+            // Verify WAL-backed crash recovery restores committed checkpointed state and discards uncommitted transactions
             string dataDir = Path.Combine(Path.GetTempPath(), "GlacierSqlCrashTest_" + Guid.NewGuid().ToString("N"));
             try
             {
-                var catalog1 = new CatalogManager(dataDir);
-                var engine1 = new SqlEngine(catalog1);
-                var context1 = new Engine.ExecutionContext(catalog1);
+                string mainFile;
+                using (var catalog1 = new CatalogManager(dataDir))
+                {
+                    var engine1 = new SqlEngine(catalog1);
+                    var context1 = new Engine.ExecutionContext(catalog1);
 
-                await engine1.ExecuteAsync("CREATE TABLE crash_table (id INT, val VARCHAR)", context1);
-                await engine1.ExecuteAsync("INSERT INTO crash_table VALUES (1, 'Initial')", context1);
+                    await engine1.ExecuteAsync("CREATE TABLE crash_table (id INT, val VARCHAR)", context1);
+                    await engine1.ExecuteAsync("INSERT INTO crash_table VALUES (1, 'Initial')", context1);
+                    await engine1.CheckpointAsync();
 
-                var tableMeta = catalog1.GetTable("crash_table")!;
-                string mainFile = tableMeta.BackingFile;
-                string backupFile = Path.Combine(dataDir, "crash_table_backup.ipc");
+                    mainFile = catalog1.GetTable("crash_table")!.BackingFile;
 
-                // 1. Manually simulate an uncommitted transaction state by creating a backup file 
-                // and mutating the main file (as if the app crashed mid-modification).
-                File.Copy(mainFile, backupFile, true);
+                    // Simulate an uncommitted transaction interrupted by a sudden process crash
+                    await engine1.ExecuteAsync("BEGIN TRANSACTION", context1);
+                    await engine1.ExecuteAsync("UPDATE crash_table SET val = 'CrashedState' WHERE id = 1", context1);
+                    await engine1.ExecuteAsync("INSERT INTO crash_table VALUES (2, 'UncommittedRow')", context1);
+                    // Dispose without COMMIT or Rollback to simulate sudden crash
+                }
 
-                // Modify main file directly with mutated data
-                var dfBackup = TableStorage.ReadTable(mainFile);
-                var col1 = new Int32Series("id", 1);
-                col1.Memory.Span[0] = 2;
-                var col2 = new Utf8StringSeries("val", new[] { "CrashedState" });
-                var mutatedDf = new DataFrame(new ISeries[] { col1, col2 });
-                TableStorage.WriteTable(mutatedDf, mainFile);
+                // Load a fresh CatalogManager pointing to the same directory to trigger WAL recovery
+                using (var catalog2 = new CatalogManager(dataDir))
+                {
+                    var engine2 = new SqlEngine(catalog2);
+                    var context2 = new Engine.ExecutionContext(catalog2);
 
-                // 2. Load a NEW catalog manager pointing to the same folder.
-                // This triggers the constructor -> Load() -> RecoverBackupFiles()!
-                var catalog2 = new CatalogManager(dataDir);
-                
-                // 3. Verify that the table was automatically restored to the pre-crash state (id=1, val='Initial')
-                var restoredDf = TableStorage.ReadTable(mainFile);
-                Assert.Equal(1, restoredDf.RowCount);
-                Assert.Equal(1, restoredDf.GetColumn("id").Get(0));
-                Assert.Equal("Initial", restoredDf.GetColumn("val").Get(0));
+                    var checkRes = await engine2.ExecuteAsync("SELECT * FROM crash_table ORDER BY id ASC", context2);
+                    Assert.True(checkRes.Success, checkRes.Message);
+                    var restoredDf = checkRes.DataFrame!;
+                    Assert.Equal(1, restoredDf.RowCount);
+                    Assert.Equal(1, restoredDf.GetColumn("id").Get(0));
+                    Assert.Equal("Initial", restoredDf.GetColumn("val").Get(0));
 
-                // Verify backup file was deleted after recovery
-                Assert.False(File.Exists(backupFile), "Backup file should be deleted after successful recovery.");
+                    var diskDf = TableStorage.ReadFromFile(mainFile);
+                    Assert.Equal(1, diskDf.RowCount);
+                    Assert.Equal("Initial", diskDf.GetColumn("val").Get(0));
+                }
             }
             finally
             {
@@ -887,36 +888,33 @@ namespace Glacier.Sql.Tests
             await _engine.ExecuteAsync("CREATE TABLE t_lock (id INT, val VARCHAR)", _context);
             await _engine.ExecuteAsync("INSERT INTO t_lock VALUES (1, 'initial')", _context);
 
-            // Start a transaction in context 1 (acquiring write lock on t_lock)
+            // Start a transaction in context 1 (acquiring exclusive write lock on t_lock)
             var tx = new SqlTransaction();
             _context.ActiveTransaction = tx;
             await _engine.ExecuteAsync("UPDATE t_lock SET val = 'tx_value' WHERE id = 1", _context);
 
+            var tableLock = _catalog.GetTableLock("t_lock");
+            Assert.True(tableLock.IsWriteLocked);
+
             // Run a parallel task trying to read t_lock
             var readContext = new Engine.ExecutionContext(_catalog);
-            var sw = System.Diagnostics.Stopwatch.StartNew();
-
             var readTask = Task.Run(async () =>
             {
                 var engine2 = new SqlEngine(_catalog);
                 return await engine2.ExecuteAsync("SELECT val FROM t_lock WHERE id = 1", readContext);
             });
 
-            // Wait 200ms to verify it is blocked
-            await Task.Delay(200);
+            // Deterministically wait until the reader is queued behind the exclusive write lock (no wall-clock sleep assertions)
+            await tableLock.WaitForReaderQueuedAsync(1).WaitAsync(TimeSpan.FromSeconds(10));
             Assert.False(readTask.IsCompleted);
 
-            // Now commit transaction
+            // Commit transaction to release the write lock and wake the queued reader
             tx.Commit();
             _context.ActiveTransaction = null;
 
-            // Now wait for the read task to finish
-            var readRes = await readTask;
-            sw.Stop();
-
+            var readRes = await readTask.WaitAsync(TimeSpan.FromSeconds(10));
             Assert.True(readRes.Success, readRes.Message);
             Assert.Equal("tx_value", readRes.DataFrame!.GetColumn("val").Get(0));
-            Assert.True(sw.ElapsedMilliseconds >= 200);
         }
     }
 }

@@ -11,17 +11,19 @@ namespace Glacier.Sql.Host
     {
         static async Task Main(string[] args)
         {
+            _ = args;
             try
             {
                 // Place the SQLite-like file catalog and binary Arrow IPC tables under the current run directory's 'Data' subfolder
                 string dataDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Data");
-                
-                var catalog = new CatalogManager(dataDir);
+
+                using var catalog = new CatalogManager(dataDir);
                 var engine = new SqlEngine(catalog);
                 var server = new SqlMcpServer(catalog, engine);
 
                 // Run the stdio JSON-RPC loop
                 await server.RunAsync();
+                catalog.Checkpoint();
             }
             catch (Exception ex)
             {

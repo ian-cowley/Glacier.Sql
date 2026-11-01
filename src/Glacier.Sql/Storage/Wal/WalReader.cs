@@ -27,21 +27,32 @@ namespace Glacier.Sql.Storage.Wal
                     return records;
                 }
 
-                using var reader = new BinaryReader(fs, Encoding.UTF8, leaveOpen: true);
+                // 1. Read and validate 32-byte header + CRC32
+                byte[] headerBuf = new byte[HeaderSize];
+                int totalHeaderRead = 0;
+                while (totalHeaderRead < HeaderSize)
+                {
+                    int r = fs.Read(headerBuf, totalHeaderRead, HeaderSize - totalHeaderRead);
+                    if (r == 0) return records;
+                    totalHeaderRead += r;
+                }
 
-                // 1. Read and validate header
-                uint magic = reader.ReadUInt32();
+                uint magic = BitConverter.ToUInt32(headerBuf.AsSpan(0, 4));
                 if (magic != WalWriter.WalMagic)
                 {
                     return records;
                 }
 
-                ushort version = reader.ReadUInt16();
-                ushort flags = reader.ReadUInt16();
-                checkpointLsn = reader.ReadUInt64();
+                uint expectedHeaderCrc = BitConverter.ToUInt32(headerBuf.AsSpan(28, 4));
+                uint actualHeaderCrc = Crc32.Compute(headerBuf.AsSpan(0, 28));
+                if (actualHeaderCrc != expectedHeaderCrc)
+                {
+                    return records;
+                }
 
-                byte[] reserved = reader.ReadBytes(12);
-                uint headerCrc = reader.ReadUInt32();
+                checkpointLsn = BitConverter.ToUInt64(headerBuf.AsSpan(8, 8));
+
+                using var reader = new BinaryReader(fs, Encoding.UTF8, leaveOpen: true);
 
                 // 2. Read frames
                 while (fs.Position + 4 <= fs.Length)
@@ -49,22 +60,23 @@ namespace Glacier.Sql.Storage.Wal
                     uint frameRemainingLength = reader.ReadUInt32(); // Body + CRC(4)
                     if (frameRemainingLength < 4 || fs.Position + frameRemainingLength > fs.Length)
                     {
-                        // Incomplete frame at EOF (e.g. crash during write)
                         break;
                     }
 
                     int bodyLength = (int)(frameRemainingLength - 4);
                     byte[] body = reader.ReadBytes(bodyLength);
-                    uint expectedCrc = reader.ReadUInt32();
-
-                    uint actualCrc = Crc32.Compute(body);
-                    if (actualCrc != expectedCrc)
+                    if (body.Length != bodyLength)
                     {
-                        // Corrupted frame detected, stop reading
                         break;
                     }
 
-                    // Parse frame body
+                    uint expectedCrc = reader.ReadUInt32();
+                    uint actualCrc = Crc32.Compute(body);
+                    if (actualCrc != expectedCrc)
+                    {
+                        break;
+                    }
+
                     // LSN(8) + TxId(16) + Type(1) + NameLen(2) + Name(N) + PayloadLen(4) + Payload(M)
                     if (body.Length < 8 + 16 + 1 + 2 + 4)
                     {

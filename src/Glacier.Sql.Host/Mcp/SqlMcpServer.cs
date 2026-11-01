@@ -1,9 +1,11 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Text.Json.Serialization.Metadata;
 using System.Threading.Tasks;
 using Glacier.Polaris;
 using Glacier.Polaris.Data;
@@ -12,6 +14,96 @@ using Glacier.Sql.Engine;
 
 namespace Glacier.Sql.Host.Mcp
 {
+    internal sealed class McpRpcResponse<TResult>
+    {
+        public string Jsonrpc { get; set; } = "2.0";
+        public JsonElement? Id { get; set; }
+        public TResult Result { get; set; } = default!;
+    }
+
+    internal sealed class McpErrorResponse
+    {
+        public string Jsonrpc { get; set; } = "2.0";
+        public JsonElement? Id { get; set; }
+        public McpErrorDetail Error { get; set; } = new();
+    }
+
+    internal sealed class McpErrorDetail
+    {
+        public int Code { get; set; }
+        public string Message { get; set; } = "";
+    }
+
+    internal sealed class McpInitializeResult
+    {
+        public string ProtocolVersion { get; set; } = "2024-11-05";
+        public McpCapabilities Capabilities { get; set; } = new();
+        public McpServerInfo ServerInfo { get; set; } = new();
+    }
+
+    internal sealed class McpCapabilities
+    {
+        public McpToolsCapability Tools { get; set; } = new();
+    }
+
+    internal sealed class McpToolsCapability
+    {
+        public bool ListChanged { get; set; }
+    }
+
+    internal sealed class McpServerInfo
+    {
+        public string Name { get; set; } = "Glacier.Sql";
+        public string Version { get; set; } = "1.1.0";
+    }
+
+    internal sealed class McpToolsListResult
+    {
+        public McpToolDefinition[] Tools { get; set; } = Array.Empty<McpToolDefinition>();
+    }
+
+    internal sealed class McpToolDefinition
+    {
+        public string Name { get; set; } = "";
+        public string Description { get; set; } = "";
+        public McpInputSchema InputSchema { get; set; } = new();
+    }
+
+    internal sealed class McpInputSchema
+    {
+        public string Type { get; set; } = "object";
+        public Dictionary<string, McpPropertySchema> Properties { get; set; } = new();
+        public string[]? Required { get; set; }
+    }
+
+    internal sealed class McpPropertySchema
+    {
+        public string Type { get; set; } = "string";
+        public string Description { get; set; } = "";
+    }
+
+    internal sealed class McpToolCallResult
+    {
+        public McpContentItem[] Content { get; set; } = Array.Empty<McpContentItem>();
+    }
+
+    internal sealed class McpContentItem
+    {
+        public string Type { get; set; } = "text";
+        public string Text { get; set; } = "";
+    }
+
+    [JsonSourceGenerationOptions(
+        PropertyNamingPolicy = JsonKnownNamingPolicy.CamelCase,
+        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull)]
+    [JsonSerializable(typeof(McpRpcResponse<McpInitializeResult>))]
+    [JsonSerializable(typeof(McpRpcResponse<McpToolsListResult>))]
+    [JsonSerializable(typeof(McpRpcResponse<McpToolCallResult>))]
+    [JsonSerializable(typeof(McpErrorResponse))]
+    internal partial class SqlMcpJsonContext : JsonSerializerContext
+    {
+    }
+
     public class SqlMcpServer
     {
         private readonly CatalogManager _catalog;
@@ -20,12 +112,6 @@ namespace Glacier.Sql.Host.Mcp
         private readonly StreamReader _reader;
         private readonly StreamWriter _writer;
         private readonly string _logPath;
-
-        private static readonly JsonSerializerOptions JsonOpts = new()
-        {
-            PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
-            DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
-        };
 
         private void Log(string message)
         {
@@ -45,14 +131,13 @@ namespace Glacier.Sql.Host.Mcp
 
             Log("SQL MCP Server instance created.");
 
-            // Setup standard IO for MCP communication
             Stream openStandardInput = Console.OpenStandardInput();
             _reader = new StreamReader(openStandardInput);
 
             Stream openStandardOutput = Console.OpenStandardOutput();
             _writer = new StreamWriter(openStandardOutput, new UTF8Encoding(false)) { AutoFlush = true };
             _writer.NewLine = "\n";
-            
+
             Log("IO setup complete.");
         }
 
@@ -83,7 +168,10 @@ namespace Glacier.Sql.Host.Mcp
                     switch (method)
                     {
                         case "initialize":
-                            await SendResponseAsync(requestId, HandleInitialize());
+                            await SendResponseAsync(
+                                requestId,
+                                HandleInitialize(),
+                                SqlMcpJsonContext.Default.McpRpcResponseMcpInitializeResult);
                             break;
 
                         case "notifications/initialized":
@@ -95,7 +183,10 @@ namespace Glacier.Sql.Host.Mcp
                             break;
 
                         case "tools/list":
-                            await SendResponseAsync(requestId, HandleToolsList());
+                            await SendResponseAsync(
+                                requestId,
+                                HandleToolsList(),
+                                SqlMcpJsonContext.Default.McpRpcResponseMcpToolsListResult);
                             break;
 
                         case "tools/call":
@@ -104,7 +195,10 @@ namespace Glacier.Sql.Host.Mcp
                                 if (root.TryGetProperty("params", out JsonElement parameters))
                                 {
                                     var result = await HandleToolCallAsync(parameters);
-                                    await SendResponseAsync(requestId, result);
+                                    await SendResponseAsync(
+                                        requestId,
+                                        result,
+                                        SqlMcpJsonContext.Default.McpRpcResponseMcpToolCallResult);
                                 }
                                 else
                                 {
@@ -138,70 +232,80 @@ namespace Glacier.Sql.Host.Mcp
             }
         }
 
-        private object HandleInitialize()
+        private static McpInitializeResult HandleInitialize()
         {
-            return new
+            return new McpInitializeResult
             {
-                protocolVersion = "2024-11-05",
-                capabilities = new { tools = new { listChanged = false } },
-                serverInfo = new { name = "Glacier.Sql", version = "1.0.0" }
+                ProtocolVersion = "2024-11-05",
+                Capabilities = new McpCapabilities
+                {
+                    Tools = new McpToolsCapability { ListChanged = false }
+                },
+                ServerInfo = new McpServerInfo
+                {
+                    Name = "Glacier.Sql",
+                    Version = "1.1.0"
+                }
             };
         }
 
-        private object HandleToolsList()
+        private static McpToolsListResult HandleToolsList()
         {
-            return new
+            return new McpToolsListResult
             {
-                tools = new[]
+                Tools = new[]
                 {
-                    new Dictionary<string, object>
+                    new McpToolDefinition
                     {
-                        { "name", "execute_sql" },
-                        { "description", "Executes a T-SQL query (e.g. SELECT, INSERT, CREATE TABLE, DROP TABLE) against the Glacier database and returns tabular results formatted as a Markdown table." },
-                        { "inputSchema", new Dictionary<string, object>
+                        Name = "execute_sql",
+                        Description = "Executes a T-SQL query (e.g. SELECT, INSERT, CREATE TABLE, DROP TABLE) against the Glacier database and returns tabular results formatted as a Markdown table.",
+                        InputSchema = new McpInputSchema
+                        {
+                            Type = "object",
+                            Properties = new Dictionary<string, McpPropertySchema>
                             {
-                                { "type", "object" },
-                                { "properties", new Dictionary<string, object>
-                                    {
-                                        { "sql", new Dictionary<string, object> { { "type", "string" }, { "description", "The SQL text to execute." } } }
-                                    }
-                                },
-                                { "required", new[] { "sql" } }
-                            }
+                                ["sql"] = new McpPropertySchema
+                                {
+                                    Type = "string",
+                                    Description = "The SQL text to execute."
+                                }
+                            },
+                            Required = new[] { "sql" }
                         }
                     },
-                    new Dictionary<string, object>
+                    new McpToolDefinition
                     {
-                        { "name", "list_tables" },
-                        { "description", "Lists all schemas and table storage statistics inside the database." },
-                        { "inputSchema", new Dictionary<string, object>
-                            {
-                                { "type", "object" },
-                                { "properties", new Dictionary<string, object>() }
-                            }
+                        Name = "list_tables",
+                        Description = "Lists all schemas and table storage statistics inside the database.",
+                        InputSchema = new McpInputSchema
+                        {
+                            Type = "object",
+                            Properties = new Dictionary<string, McpPropertySchema>()
                         }
                     },
-                    new Dictionary<string, object>
+                    new McpToolDefinition
                     {
-                        { "name", "get_table_schema" },
-                        { "description", "Retrieves metadata and columns definition details for a specific table." },
-                        { "inputSchema", new Dictionary<string, object>
+                        Name = "get_table_schema",
+                        Description = "Retrieves metadata and columns definition details for a specific table.",
+                        InputSchema = new McpInputSchema
+                        {
+                            Type = "object",
+                            Properties = new Dictionary<string, McpPropertySchema>
                             {
-                                { "type", "object" },
-                                { "properties", new Dictionary<string, object>
-                                    {
-                                        { "tableName", new Dictionary<string, object> { { "type", "string" }, { "description", "The name of the table to inspect." } } }
-                                    }
-                                },
-                                { "required", new[] { "tableName" } }
-                            }
+                                ["tableName"] = new McpPropertySchema
+                                {
+                                    Type = "string",
+                                    Description = "The name of the table to inspect."
+                                }
+                            },
+                            Required = new[] { "tableName" }
                         }
                     }
                 }
             };
         }
 
-        private async Task<object> HandleToolCallAsync(JsonElement parameters)
+        private async Task<McpToolCallResult> HandleToolCallAsync(JsonElement parameters)
         {
             string name = parameters.GetProperty("name").GetString() ?? "";
             JsonElement args = parameters.GetProperty("arguments");
@@ -237,8 +341,11 @@ namespace Glacier.Sql.Host.Mcp
                     int rowCount = 0;
                     try
                     {
-                        var df = TableStorage.ReadTable(t.BackingFile);
-                        rowCount = df.RowCount;
+                        var entry = _catalog.BufferPool.GetOrLoad(t);
+                        using (entry.AcquireReadLock())
+                        {
+                            rowCount = entry.CurrentSnapshot.RowCount;
+                        }
                     }
                     catch { }
 
@@ -272,18 +379,18 @@ namespace Glacier.Sql.Host.Mcp
             throw new Exception($"Tool '{name}' is not supported.");
         }
 
-        private static object CreateToolResponse(string text)
+        private static McpToolCallResult CreateToolResponse(string text)
         {
-            return new
+            return new McpToolCallResult
             {
-                content = new[]
+                Content = new[]
                 {
-                    new { type = "text", text = text }
+                    new McpContentItem { Type = "text", Text = text }
                 }
             };
         }
 
-        private string FormatDataFrameAsMarkdown(DataFrame df)
+        private static string FormatDataFrameAsMarkdown(DataFrame df)
         {
             if (df.Columns.Count == 0) return "No columns returned.";
             if (df.RowCount == 0)
@@ -292,7 +399,7 @@ namespace Glacier.Sql.Host.Mcp
             }
 
             var sb = new StringBuilder();
-            
+
             // Header
             sb.Append("| ");
             foreach (var col in df.Columns)
@@ -303,7 +410,7 @@ namespace Glacier.Sql.Host.Mcp
 
             // Divider
             sb.Append("| ");
-            foreach (var col in df.Columns)
+            foreach (var _ in df.Columns)
             {
                 sb.Append("--- | ");
             }
@@ -323,7 +430,6 @@ namespace Glacier.Sql.Host.Mcp
                     }
                     else if (col is TimeSeries && val is long ms)
                     {
-                        // Format Epoch milliseconds to DateTime string
                         var dt = DateTimeOffset.FromUnixTimeMilliseconds(ms).DateTime;
                         cellStr = dt.ToString("yyyy-MM-dd HH:mm:ss");
                     }
@@ -341,38 +447,33 @@ namespace Glacier.Sql.Host.Mcp
             return sb.ToString();
         }
 
-        private async Task SendResponseAsync(JsonElement id, object result)
+        private async Task SendResponseAsync<TResult>(
+            JsonElement id,
+            TResult result,
+            JsonTypeInfo<McpRpcResponse<TResult>> typeInfo)
         {
-            var response = new Dictionary<string, object>
+            var response = new McpRpcResponse<TResult>
             {
-                ["jsonrpc"] = "2.0",
-                ["result"] = result
+                Jsonrpc = "2.0",
+                Id = id.ValueKind != JsonValueKind.Undefined ? id.Clone() : null,
+                Result = result
             };
 
-            if (id.ValueKind != JsonValueKind.Undefined)
-            {
-                response["id"] = id;
-            }
-
-            string json = JsonSerializer.Serialize(response, JsonOpts);
+            string json = JsonSerializer.Serialize(response, typeInfo);
             Log($"Sending response: {json}");
             await _writer.WriteLineAsync(json);
         }
 
         private async Task SendErrorAsync(JsonElement id, int code, string message)
         {
-            var response = new Dictionary<string, object>
+            var response = new McpErrorResponse
             {
-                ["jsonrpc"] = "2.0",
-                ["error"] = new { code, message }
+                Jsonrpc = "2.0",
+                Id = id.ValueKind != JsonValueKind.Undefined ? id.Clone() : null,
+                Error = new McpErrorDetail { Code = code, Message = message }
             };
 
-            if (id.ValueKind != JsonValueKind.Undefined)
-            {
-                response["id"] = id;
-            }
-
-            string json = JsonSerializer.Serialize(response, JsonOpts);
+            string json = JsonSerializer.Serialize(response, SqlMcpJsonContext.Default.McpErrorResponse);
             Log($"Sending error: {json}");
             await _writer.WriteLineAsync(json);
         }

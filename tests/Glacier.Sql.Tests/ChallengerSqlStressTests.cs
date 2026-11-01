@@ -225,29 +225,46 @@ public class ChallengerSqlStressTests : IDisposable
     }
 
     [Fact]
-    public async Task VulnerabilityFinding_NegativeNumberInInsert_ThrowsNotSupportedException()
+    public async Task SignedAndBoundaryNumbersInInsert_ExecuteAccurately()
     {
-        await _engine.ExecuteAsync("CREATE TABLE num_table (val DOUBLE)", _context);
-        
-        // Negative number literal in INSERT is parsed as SqlUnaryExpression("-", SqlLiteral(42.0)),
-        // which SqlEngine.Dml line 42 rejects because it only permits SqlLiteral.
-        var res = await _engine.ExecuteAsync("INSERT INTO num_table VALUES (-42.0)", _context);
-        Assert.False(res.Success);
-        Assert.Contains("Only literal values are supported in INSERT statements", res.Message);
+        await _engine.ExecuteAsync("CREATE TABLE num_table (id INT, val DOUBLE)", _context);
+
+        var r1 = await _engine.ExecuteAsync("INSERT INTO num_table VALUES (-5, -42.0)", _context);
+        Assert.True(r1.Success, r1.Message);
+
+        var r2 = await _engine.ExecuteAsync("INSERT INTO num_table VALUES (+10, +3.14)", _context);
+        Assert.True(r2.Success, r2.Message);
+
+        var r3 = await _engine.ExecuteAsync("INSERT INTO num_table VALUES (-2147483648, -0.5)", _context);
+        Assert.True(r3.Success, r3.Message);
+
+        var sel = await _engine.ExecuteAsync("SELECT id, val FROM num_table ORDER BY id ASC", _context);
+        Assert.True(sel.Success, sel.Message);
+        Assert.Equal(3, sel.DataFrame!.RowCount);
+        Assert.Equal(int.MinValue, sel.DataFrame.GetColumn("id").Get(0));
+        Assert.Equal(-5, sel.DataFrame.GetColumn("id").Get(1));
+        Assert.Equal(-42.0, sel.DataFrame.GetColumn("val").Get(1));
+        Assert.Equal(10, sel.DataFrame.GetColumn("id").Get(2));
+        Assert.Equal(3.14, Convert.ToDouble(sel.DataFrame.GetColumn("val").Get(2)), 5);
     }
 
     [Fact]
-    public async Task VulnerabilityFinding_AlterTableAddVarchar_FailsDueToNullStringArray()
+    public async Task AlterTableAddVarchar_OnNonEmptyTable_PopulatesNullSeriesCleanly()
     {
         await _engine.ExecuteAsync("CREATE TABLE employee_notes (id INT)", _context);
         await _engine.ExecuteAsync("INSERT INTO employee_notes VALUES (1)", _context);
 
-        // When ALTER TABLE ADD ... VARCHAR executes on a table with rows, SqlEngine.CreateNullSeries creates
-        // new string[length] which has null elements. Utf8StringSeries constructor does not accept null elements,
-        // throwing ArgumentNullException: Value cannot be null. (Parameter 'chars').
         var alterRes = await _engine.ExecuteAsync("ALTER TABLE employee_notes ADD notes VARCHAR", _context);
-        Assert.False(alterRes.Success);
-        Assert.Contains("ArgumentNullException", alterRes.Message);
+        Assert.True(alterRes.Success, alterRes.Message);
+
+        var insertAfter = await _engine.ExecuteAsync("INSERT INTO employee_notes VALUES (2, 'Promoted')", _context);
+        Assert.True(insertAfter.Success, insertAfter.Message);
+
+        var selectRes = await _engine.ExecuteAsync("SELECT id, notes FROM employee_notes ORDER BY id ASC", _context);
+        Assert.True(selectRes.Success, selectRes.Message);
+        Assert.Equal(2, selectRes.DataFrame!.RowCount);
+        Assert.False(selectRes.DataFrame.GetColumn("notes").ValidityMask.IsValid(0));
+        Assert.Equal("Promoted", selectRes.DataFrame.GetColumn("notes").Get(1));
     }
 
     [Fact]

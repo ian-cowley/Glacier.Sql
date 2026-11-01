@@ -5,6 +5,7 @@ using System.Threading.Tasks;
 using Glacier.Polaris;
 using Glacier.Sql.Catalog;
 using Glacier.Sql.Parser;
+using Glacier.Sql.Storage.Wal;
 
 namespace Glacier.Sql.Engine
 {
@@ -29,14 +30,10 @@ namespace Glacier.Sql.Engine
             }).ToList();
 
             catalog.AddTable(create.TableName, columns);
-
-            var meta = catalog.GetTable(create.TableName)!;
-            TableStorage.InitializeTable(meta.BackingFile, columns);
-
             return ExecuteResult.Ok($"Table '{create.TableName}' created successfully.");
         }
 
-        private ExecuteResult ExecuteDrop(DropTableStatement drop, ExecutionContext context)
+        private async Task<ExecuteResult> ExecuteDrop(DropTableStatement drop, ExecutionContext context)
         {
             var catalog = context.Catalog;
             if (!catalog.TableExists(drop.TableName))
@@ -44,23 +41,40 @@ namespace Glacier.Sql.Engine
                 return ExecuteResult.Error($"Table '{drop.TableName}' does not exist.");
             }
 
-            catalog.RemoveTable(drop.TableName);
-            return ExecuteResult.Ok($"Table '{drop.TableName}' dropped successfully.");
+            using (await AcquireLockAsync(drop.TableName, exclusive: true, context))
+            {
+                if (!catalog.TableExists(drop.TableName))
+                {
+                    return ExecuteResult.Error($"Table '{drop.TableName}' does not exist.");
+                }
+
+                catalog.RemoveTable(drop.TableName);
+                return ExecuteResult.Ok($"Table '{drop.TableName}' dropped successfully.");
+            }
         }
 
         private async Task<ExecuteResult> ExecuteAlter(AlterTableStatement alter, ExecutionContext context)
         {
             var catalog = context.Catalog;
-            var meta = catalog.GetTable(alter.TableName);
-            if (meta == null)
+            if (!catalog.TableExists(alter.TableName))
             {
                 return ExecuteResult.Error($"Table '{alter.TableName}' does not exist.");
             }
 
-            using (AcquireLock(alter.TableName, true, context))
+            using (await AcquireLockAsync(alter.TableName, exclusive: true, context))
             {
+                var meta = catalog.GetTable(alter.TableName);
+                if (meta == null)
+                {
+                    return ExecuteResult.Error($"Table '{alter.TableName}' does not exist.");
+                }
+
                 var alterEntry = catalog.BufferPool.GetOrLoad(meta);
-                var df = alterEntry.CurrentSnapshot;
+                DataFrame df;
+                using (alterEntry.AcquireReadLock())
+                {
+                    df = alterEntry.CurrentSnapshot;
+                }
 
                 if (alter.AlterAction.Equals("ADD", StringComparison.OrdinalIgnoreCase))
                 {
@@ -75,7 +89,19 @@ namespace Glacier.Sql.Engine
                         return ExecuteResult.Error($"Cannot add NOT NULL column '{colDef.Name}' to a non-empty table '{alter.TableName}'.");
                     }
 
-                    BackupForTransaction(meta, catalog, context);
+                    var oldColumns = new List<ColumnMetadata>(meta.Columns);
+                    var oldDf = df;
+
+                    if (context.ActiveTransaction != null)
+                    {
+                        context.ActiveTransaction.RegisterRollback(() =>
+                        {
+                            meta.Columns.Clear();
+                            meta.Columns.AddRange(oldColumns);
+                            TableStorage.WriteTable(oldDf, meta.BackingFile, catalog.BufferPool);
+                            catalog.Save();
+                        });
+                    }
 
                     var newColMeta = new ColumnMetadata
                     {
@@ -92,13 +118,7 @@ namespace Glacier.Sql.Engine
                     var newCols = df.Columns.Concat(new[] { newSeries }).ToList();
                     var newDf = new DataFrame(newCols);
 
-                    TableStorage.WriteTable(newDf, meta.BackingFile);
-                    using (alterEntry.AcquireWriteLock())
-                    {
-                        alterEntry.CurrentSnapshot = newDf;
-                        alterEntry.IsDirty = false;
-                    }
-                    catalog.Save();
+                    PersistAlteredTable(meta, newDf, alterEntry, catalog);
 
                     return ExecuteResult.Ok($"Column '{colDef.Name}' added to table '{alter.TableName}' successfully.");
                 }
@@ -116,20 +136,26 @@ namespace Glacier.Sql.Engine
                         return ExecuteResult.Error($"Cannot drop column '{colName}' because it is the only column in table '{alter.TableName}'.");
                     }
 
-                    BackupForTransaction(meta, catalog, context);
+                    var oldColumns = new List<ColumnMetadata>(meta.Columns);
+                    var oldDf = df;
+
+                    if (context.ActiveTransaction != null)
+                    {
+                        context.ActiveTransaction.RegisterRollback(() =>
+                        {
+                            meta.Columns.Clear();
+                            meta.Columns.AddRange(oldColumns);
+                            TableStorage.WriteTable(oldDf, meta.BackingFile, catalog.BufferPool);
+                            catalog.Save();
+                        });
+                    }
 
                     meta.Columns.Remove(targetCol);
 
                     var newCols = df.Columns.Where(c => !c.Name.Equals(colName, StringComparison.OrdinalIgnoreCase)).ToList();
                     var newDf = new DataFrame(newCols);
 
-                    TableStorage.WriteTable(newDf, meta.BackingFile);
-                    using (alterEntry.AcquireWriteLock())
-                    {
-                        alterEntry.CurrentSnapshot = newDf;
-                        alterEntry.IsDirty = false;
-                    }
-                    catalog.Save();
+                    PersistAlteredTable(meta, newDf, alterEntry, catalog);
 
                     return ExecuteResult.Ok($"Column '{colName}' dropped from table '{alter.TableName}' successfully.");
                 }
@@ -138,6 +164,36 @@ namespace Glacier.Sql.Engine
                     return ExecuteResult.Error($"Unsupported alter action: {alter.AlterAction}");
                 }
             }
+        }
+
+        private static void PersistAlteredTable(
+            TableMetadata meta,
+            DataFrame newDf,
+            Storage.BufferPool.TableBufferEntry alterEntry,
+            CatalogManager catalog)
+        {
+            TableStorage.WriteTable(newDf, meta.BackingFile);
+
+            ulong ckLsn = catalog.WalWriter.AppendRecord(
+                WalRecordType.CheckpointEnd,
+                Guid.Empty,
+                meta.TableName,
+                ReadOnlySpan<byte>.Empty);
+
+            using (alterEntry.AcquireWriteLock())
+            {
+                alterEntry.CurrentSnapshot = newDf;
+                alterEntry.CommittedSnapshot = newDf;
+                alterEntry.LastAppliedLsn = ckLsn;
+                alterEntry.LastCommittedLsn = ckLsn;
+                alterEntry.HasUnflushedCommittedChanges = false;
+                alterEntry.FirstUnflushedLsn = 0;
+                alterEntry.FirstUncommittedTxLsn = 0;
+                alterEntry.IsDirty = false;
+            }
+
+            catalog.BufferPool.AdvanceSafeCheckpointLsn(catalog.WalWriter, ckLsn);
+            catalog.Save();
         }
 
         private ExecuteResult ExecuteCreateView(CreateViewStatement createView, ExecutionContext context)

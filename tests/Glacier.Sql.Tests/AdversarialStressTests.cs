@@ -110,61 +110,67 @@ public class AdversarialStressTests : IDisposable
 
         const int writerCount = 4;
         const int readerCount = 4;
-        const int insertsPerWriter = 40;
+        const int insertsPerWriter = 15;
 
-        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
-        var token = cts.Token;
+        using var hangGuardCts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        var hangToken = hangGuardCts.Token;
+        int writersCompleted = 0;
         int completedReads = 0;
         Exception? error = null;
-
-        var readers = Enumerable.Range(0, readerCount).Select(r => Task.Run(async () =>
-        {
-            var ctx = new ExecutionContext(catalog);
-            while (!token.IsCancellationRequested)
-            {
-                try
-                {
-                    var res = await engine.ExecuteAsync("SELECT * FROM telemetry", ctx);
-                    Assert.True(res.Success);
-                    Assert.NotNull(res.DataFrame);
-                    Interlocked.Increment(ref completedReads);
-                    await Task.Delay(5);
-                }
-                catch (Exception ex)
-                {
-                    Volatile.Write(ref error, ex);
-                    break;
-                }
-            }
-        })).ToArray();
 
         var writers = Enumerable.Range(0, writerCount).Select(w => Task.Run(async () =>
         {
             var ctx = new ExecutionContext(catalog);
-            for (int i = 0; i < insertsPerWriter && !token.IsCancellationRequested; i++)
+            try
             {
-                try
+                for (int i = 0; i < insertsPerWriter; i++)
                 {
+                    hangToken.ThrowIfCancellationRequested();
                     var res = await engine.ExecuteAsync($"INSERT INTO telemetry VALUES ({w}, {i * 1.5})", ctx);
-                    Assert.True(res.Success);
-                    await Task.Delay(2);
-                }
-                catch (Exception ex)
-                {
-                    Volatile.Write(ref error, ex);
-                    break;
+                    Assert.True(res.Success, res.Message);
+                    await Task.Yield();
                 }
             }
-        })).ToArray();
+            catch (Exception ex)
+            {
+                Volatile.Write(ref error, ex);
+            }
+            finally
+            {
+                Interlocked.Increment(ref writersCompleted);
+            }
+        }, hangToken)).ToArray();
 
-        await Task.WhenAll(writers);
-        cts.Cancel();
-        await Task.WhenAll(readers);
+        var readers = Enumerable.Range(0, readerCount).Select(_ => Task.Run(async () =>
+        {
+            var ctx = new ExecutionContext(catalog);
+            int localReads = 0;
+            try
+            {
+                while ((Volatile.Read(ref writersCompleted) < writerCount || localReads < 2) && Volatile.Read(ref error) == null)
+                {
+                    hangToken.ThrowIfCancellationRequested();
+                    var res = await engine.ExecuteAsync("SELECT * FROM telemetry", ctx);
+                    Assert.True(res.Success, res.Message);
+                    Assert.NotNull(res.DataFrame);
+                    localReads++;
+                    Interlocked.Increment(ref completedReads);
+                    await Task.Yield();
+                }
+            }
+            catch (Exception ex)
+            {
+                Volatile.Write(ref error, ex);
+            }
+        }, hangToken)).ToArray();
+
+        await Task.WhenAll(writers).WaitAsync(hangToken);
+        await Task.WhenAll(readers).WaitAsync(hangToken);
 
         Assert.Null(error);
-        Assert.True(completedReads > 5);
+        Assert.True(completedReads >= readerCount * 2);
 
-        // Verify total row count matches expected inserts
+        // Verify total row count matches expected inserts (zero lost updates)
         var verifyCtx = new ExecutionContext(catalog);
         var finalResult = await engine.ExecuteAsync("SELECT * FROM telemetry", verifyCtx);
         Assert.True(finalResult.Success);

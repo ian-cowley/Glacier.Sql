@@ -17,8 +17,16 @@ namespace Glacier.Sql.Storage.Wal
         private ulong _checkpointLsn;
         private bool _disposed;
 
-        public ulong CurrentLsn => _currentLsn;
-        public ulong CheckpointLsn => _checkpointLsn;
+        public ulong CurrentLsn
+        {
+            get { lock (_syncLock) return _currentLsn; }
+        }
+
+        public ulong CheckpointLsn
+        {
+            get { lock (_syncLock) return _checkpointLsn; }
+        }
+
         public string WalFilePath => _walFilePath;
 
         public WalWriter(string walFilePath, ulong initialLsn = 0)
@@ -39,29 +47,113 @@ namespace Glacier.Sql.Storage.Wal
             if (isNew)
             {
                 WriteHeader(0);
+                _stream.SetLength(HeaderSize);
+                _stream.Flush(true);
             }
-            else
+            else if (!ReadExistingHeaderAndScanFrames())
             {
-                ReadExistingHeader();
-                _stream.Seek(0, SeekOrigin.End);
+                WriteHeader(_currentLsn);
+                _stream.SetLength(HeaderSize);
+                _stream.Flush(true);
             }
         }
 
-        private void ReadExistingHeader()
+        private bool ReadExistingHeaderAndScanFrames()
         {
-            _stream.Seek(0, SeekOrigin.Begin);
-            using var reader = new BinaryReader(_stream, Encoding.UTF8, leaveOpen: true);
-            uint magic = reader.ReadUInt32();
-            if (magic == WalMagic)
+            if (_stream.Length < HeaderSize)
             {
-                ushort version = reader.ReadUInt16();
-                ushort flags = reader.ReadUInt16();
-                _checkpointLsn = reader.ReadUInt64();
-                if (_currentLsn < _checkpointLsn)
-                {
-                    _currentLsn = _checkpointLsn;
-                }
+                return false;
             }
+
+            _stream.Seek(0, SeekOrigin.Begin);
+            Span<byte> headerBuf = stackalloc byte[HeaderSize];
+            int totalRead = 0;
+            while (totalRead < HeaderSize)
+            {
+                int r = _stream.Read(headerBuf.Slice(totalRead));
+                if (r == 0) return false;
+                totalRead += r;
+            }
+
+            uint magic = BitConverter.ToUInt32(headerBuf.Slice(0, 4));
+            if (magic != WalMagic)
+            {
+                return false;
+            }
+
+            uint expectedHeaderCrc = BitConverter.ToUInt32(headerBuf.Slice(28, 4));
+            uint actualHeaderCrc = Crc32.Compute(headerBuf.Slice(0, 28));
+            if (actualHeaderCrc != expectedHeaderCrc)
+            {
+                return false;
+            }
+
+            _checkpointLsn = BitConverter.ToUInt64(headerBuf.Slice(8, 8));
+            if (_currentLsn < _checkpointLsn)
+            {
+                _currentLsn = _checkpointLsn;
+            }
+
+            // Scan existing frames to restore monotonic maxFrameLsn and trim any torn tail
+            using var reader = new BinaryReader(_stream, Encoding.UTF8, leaveOpen: true);
+            long lastValidPos = HeaderSize;
+            long fileLen = _stream.Length;
+
+            while (_stream.Position + 4 <= fileLen)
+            {
+                uint frameRemainingLength = reader.ReadUInt32();
+                if (frameRemainingLength < 4 || _stream.Position + frameRemainingLength > fileLen)
+                {
+                    break;
+                }
+
+                int bodyLength = (int)(frameRemainingLength - 4);
+                byte[] body = reader.ReadBytes(bodyLength);
+                if (body.Length != bodyLength)
+                {
+                    break;
+                }
+
+                uint expectedFrameCrc = reader.ReadUInt32();
+                uint actualFrameCrc = Crc32.Compute(body);
+                if (actualFrameCrc != expectedFrameCrc || body.Length < 8 + 16 + 1 + 2 + 4)
+                {
+                    break;
+                }
+
+                int offset = 8 + 16 + 1;
+                ushort nameLen = BitConverter.ToUInt16(body.AsSpan(offset, 2));
+                offset += 2;
+                if (offset + nameLen + 4 > body.Length)
+                {
+                    break;
+                }
+
+                offset += nameLen;
+                uint payloadLen = BitConverter.ToUInt32(body.AsSpan(offset, 4));
+                offset += 4;
+                if (offset + payloadLen > body.Length)
+                {
+                    break;
+                }
+
+                ulong frameLsn = BitConverter.ToUInt64(body.AsSpan(0, 8));
+                if (frameLsn > _currentLsn)
+                {
+                    _currentLsn = frameLsn;
+                }
+
+                lastValidPos = _stream.Position;
+            }
+
+            if (lastValidPos < fileLen)
+            {
+                _stream.SetLength(lastValidPos);
+                _stream.Flush(true);
+            }
+
+            _stream.Seek(0, SeekOrigin.End);
+            return true;
         }
 
         private void WriteHeader(ulong checkpointLsn)
@@ -69,17 +161,17 @@ namespace Glacier.Sql.Storage.Wal
             _checkpointLsn = checkpointLsn;
             _stream.Seek(0, SeekOrigin.Begin);
 
-            byte[] headerBuf = new byte[HeaderSize];
-            BitConverter.TryWriteBytes(headerBuf.AsSpan(0, 4), WalMagic);
-            BitConverter.TryWriteBytes(headerBuf.AsSpan(4, 2), (ushort)1); // Version
-            BitConverter.TryWriteBytes(headerBuf.AsSpan(6, 2), (ushort)0); // Flags
-            BitConverter.TryWriteBytes(headerBuf.AsSpan(8, 8), checkpointLsn); // CheckpointLSN
-            // 16..27 are 12 reserved bytes (zeroed)
+            Span<byte> headerBuf = stackalloc byte[HeaderSize];
+            headerBuf.Clear();
+            BitConverter.TryWriteBytes(headerBuf.Slice(0, 4), WalMagic);
+            BitConverter.TryWriteBytes(headerBuf.Slice(4, 2), (ushort)1); // Version
+            BitConverter.TryWriteBytes(headerBuf.Slice(6, 2), (ushort)0); // Flags
+            BitConverter.TryWriteBytes(headerBuf.Slice(8, 8), checkpointLsn); // CheckpointLSN
 
-            uint headerCrc = Crc32.Compute(headerBuf.AsSpan(0, 28));
-            BitConverter.TryWriteBytes(headerBuf.AsSpan(28, 4), headerCrc);
+            uint headerCrc = Crc32.Compute(headerBuf.Slice(0, 28));
+            BitConverter.TryWriteBytes(headerBuf.Slice(28, 4), headerCrc);
 
-            _writer.Write(headerBuf);
+            _stream.Write(headerBuf);
             _stream.Flush(true);
         }
 
@@ -87,9 +179,19 @@ namespace Glacier.Sql.Storage.Wal
         {
             lock (_syncLock)
             {
-                long currentPos = _stream.Position;
-                WriteHeader(checkpointLsn);
-                _stream.Seek(currentPos, SeekOrigin.Begin);
+                if (_disposed) throw new ObjectDisposedException(nameof(WalWriter));
+
+                if (checkpointLsn > _currentLsn)
+                {
+                    _currentLsn = checkpointLsn;
+                }
+
+                if (checkpointLsn >= _checkpointLsn)
+                {
+                    long endPos = Math.Max(_stream.Length, HeaderSize);
+                    WriteHeader(checkpointLsn);
+                    _stream.Seek(endPos, SeekOrigin.Begin);
+                }
             }
         }
 
@@ -100,7 +202,7 @@ namespace Glacier.Sql.Storage.Wal
                 if (_disposed) throw new ObjectDisposedException(nameof(WalWriter));
 
                 ulong lsn = ++_currentLsn;
-                byte[] nameBytes = Encoding.UTF8.GetBytes(tableName);
+                byte[] nameBytes = Encoding.UTF8.GetBytes(tableName ?? string.Empty);
 
                 // Body = LSN(8) + TxId(16) + Type(1) + NameLen(2) + Name(N) + PayloadLen(4) + Payload(M)
                 int bodyLength = 8 + 16 + 1 + 2 + nameBytes.Length + 4 + payload.Length;
@@ -127,14 +229,13 @@ namespace Glacier.Sql.Storage.Wal
                 if (!payload.IsEmpty)
                 {
                     payload.CopyTo(frameBody.AsSpan(offset, payload.Length));
-                    offset += payload.Length;
                 }
 
                 uint frameCrc = Crc32.Compute(frameBody);
 
                 // Write to stream: Length(4) + Body(N) + CRC32(4)
                 _stream.Seek(0, SeekOrigin.End);
-                _writer.Write((uint)(bodyLength + 4)); // Total frame payload after length field
+                _writer.Write((uint)(bodyLength + 4));
                 _writer.Write(frameBody);
                 _writer.Write(frameCrc);
                 _stream.Flush(true);
@@ -148,7 +249,10 @@ namespace Glacier.Sql.Storage.Wal
             lock (_syncLock)
             {
                 if (_disposed) return;
-                _currentLsn = newCheckpointLsn;
+                if (newCheckpointLsn > _currentLsn)
+                {
+                    _currentLsn = newCheckpointLsn;
+                }
                 WriteHeader(newCheckpointLsn);
                 _stream.SetLength(HeaderSize);
                 _stream.Flush(true);

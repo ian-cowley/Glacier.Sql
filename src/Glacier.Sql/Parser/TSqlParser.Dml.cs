@@ -130,7 +130,7 @@ namespace Glacier.Sql.Parser
             if (Match(TokenType.Top))
             {
                 var numToken = Consume(TokenType.NumberLiteral, "Expected number after TOP clause");
-                stmt.Top = int.Parse(numToken.Text);
+                stmt.Top = int.Parse(numToken.Text, System.Globalization.CultureInfo.InvariantCulture);
             }
 
             // Projections

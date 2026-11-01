@@ -107,6 +107,8 @@ namespace Glacier.Sql.Parser
             { "FALSE", TokenType.BooleanLiteral }
         };
 
+        public static bool IsKeyword(string text) => Keywords.ContainsKey(text);
+
         public SqlLexer(string input)
         {
             _input = input ?? "";

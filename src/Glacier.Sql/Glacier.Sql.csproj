@@ -4,7 +4,11 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
-    <Version>1.0.4</Version>
+    <IsAotCompatible>true</IsAotCompatible>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
+    <Version>1.1.0</Version>
     <Description>High-performance T-SQL query execution engine built on top of the Glacier.Polaris columnar memory DataFrame engine.</Description>
     <Authors>Glacier Contributors</Authors>
     <PackageTags>sql query-engine polaris dataframe arrow ipc db database transactional locks triggers</PackageTags>
@@ -18,6 +22,7 @@
 
   <ItemGroup>
     <PackageReference Include="Glacier.Polaris" Version="1.0.20" />
+    <PackageReference Include="System.Security.Cryptography.Pkcs" Version="10.0.14" />
     <None Include="..\..\README.md" Pack="true" PackagePath="\" />
   </ItemGroup>
 </Project>

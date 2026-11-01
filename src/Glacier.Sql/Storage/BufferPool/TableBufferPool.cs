@@ -1,7 +1,6 @@
 using System;
 using System.Collections.Concurrent;
 using System.IO;
-using System.Linq;
 using Glacier.Polaris;
 using Glacier.Sql.Catalog;
 using Glacier.Sql.Storage.Wal;
@@ -94,45 +93,11 @@ namespace Glacier.Sql.Storage.BufferPool
         public void CheckpointTable(string tableName, WalWriter? walWriter = null)
         {
             if (!_buffers.TryGetValue(tableName, out var entry)) return;
-            if (!entry.IsDirty || string.IsNullOrEmpty(entry.BackingFile)) return;
 
-            DataFrame snapshot;
-            ulong lsn;
-            using (entry.AcquireReadLock())
+            ulong flushedLsn = FlushCommittedEntry(entry, walWriter);
+            if (walWriter != null && flushedLsn > 0)
             {
-                snapshot = entry.CurrentSnapshot;
-                lsn = entry.LastAppliedLsn;
-            }
-
-            string targetPath = entry.BackingFile;
-            string? dir = Path.GetDirectoryName(targetPath);
-            if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
-            {
-                Directory.CreateDirectory(dir);
-            }
-
-            string tmpPath = targetPath + ".tmp." + Guid.NewGuid().ToString("N");
-            try
-            {
-                snapshot.WriteIpc(tmpPath);
-                File.Move(tmpPath, targetPath, overwrite: true);
-
-                using (entry.AcquireWriteLock())
-                {
-                    entry.IsDirty = false;
-                }
-
-                if (walWriter != null && lsn > 0)
-                {
-                    walWriter.UpdateCheckpointLsn(lsn);
-                }
-            }
-            finally
-            {
-                if (File.Exists(tmpPath))
-                {
-                    try { File.Delete(tmpPath); } catch { }
-                }
+                AdvanceSafeCheckpointLsn(walWriter, flushedLsn);
             }
         }
 
@@ -147,57 +112,10 @@ namespace Glacier.Sql.Storage.BufferPool
 
             foreach (var kvp in _buffers)
             {
-                var entry = kvp.Value;
-                if (entry.IsDirty && !string.IsNullOrEmpty(entry.BackingFile))
+                ulong flushedLsn = FlushCommittedEntry(kvp.Value, walWriter);
+                if (flushedLsn > highestFlushedLsn)
                 {
-                    DataFrame snapshot;
-                    ulong lsn;
-                    using (entry.AcquireReadLock())
-                    {
-                        snapshot = entry.CurrentSnapshot;
-                        lsn = entry.LastAppliedLsn;
-                    }
-
-                    string targetPath = entry.BackingFile;
-                    string? dir = Path.GetDirectoryName(targetPath);
-                    if (string.IsNullOrEmpty(dir)) continue;
-
-                    string tmpPath = targetPath + ".tmp." + Guid.NewGuid().ToString("N");
-                    try
-                    {
-                        if (!Directory.Exists(dir))
-                        {
-                            Directory.CreateDirectory(dir);
-                        }
-
-                        snapshot.WriteIpc(tmpPath);
-
-                        if (Directory.Exists(dir))
-                        {
-                            File.Move(tmpPath, targetPath, overwrite: true);
-
-                            using (entry.AcquireWriteLock())
-                            {
-                                entry.IsDirty = false;
-                            }
-
-                            if (lsn > highestFlushedLsn)
-                            {
-                                highestFlushedLsn = lsn;
-                            }
-                        }
-                    }
-                    catch (Exception ex) when (ex is UnauthorizedAccessException or DirectoryNotFoundException or IOException)
-                    {
-                        // Target directory may have been concurrently deleted or locked during cleanup
-                    }
-                    finally
-                    {
-                        if (File.Exists(tmpPath))
-                        {
-                            try { File.Delete(tmpPath); } catch { }
-                        }
-                    }
+                    highestFlushedLsn = flushedLsn;
                 }
             }
 
@@ -206,9 +124,119 @@ namespace Glacier.Sql.Storage.BufferPool
                 walWriter.AppendRecord(WalRecordType.CheckpointEnd, Guid.Empty, string.Empty, ReadOnlySpan<byte>.Empty);
                 if (highestFlushedLsn > 0)
                 {
-                    walWriter.UpdateCheckpointLsn(highestFlushedLsn);
+                    AdvanceSafeCheckpointLsn(walWriter, highestFlushedLsn);
                 }
             }
+        }
+
+        internal void AdvanceSafeCheckpointLsn(WalWriter walWriter, ulong maxCandidateLsn)
+        {
+            ulong minPendingLsn = ulong.MaxValue;
+
+            foreach (var kvp in _buffers)
+            {
+                var entry = kvp.Value;
+                using (entry.AcquireReadLock())
+                {
+                    if (entry.HasUnflushedCommittedChanges || entry.ActiveTransactionId != Guid.Empty)
+                    {
+                        ulong pending = entry.FirstUnflushedLsn > 0
+                            ? entry.FirstUnflushedLsn
+                            : (entry.FirstUncommittedTxLsn > 0 ? entry.FirstUncommittedTxLsn : 1UL);
+
+                        if (pending < minPendingLsn)
+                        {
+                            minPendingLsn = pending;
+                        }
+                    }
+                }
+            }
+
+            ulong safeLsn = minPendingLsn == ulong.MaxValue
+                ? maxCandidateLsn
+                : Math.Min(maxCandidateLsn, minPendingLsn - 1);
+
+            if (safeLsn > walWriter.CheckpointLsn)
+            {
+                walWriter.UpdateCheckpointLsn(safeLsn);
+            }
+        }
+
+        private static ulong FlushCommittedEntry(TableBufferEntry entry, WalWriter? walWriter)
+        {
+            DataFrame snapshot;
+            ulong lsn;
+            string targetPath;
+
+            using (entry.AcquireReadLock())
+            {
+                if (!entry.HasUnflushedCommittedChanges || string.IsNullOrEmpty(entry.BackingFile))
+                {
+                    return 0;
+                }
+
+                snapshot = entry.CommittedSnapshot;
+                lsn = entry.LastCommittedLsn;
+                targetPath = entry.BackingFile;
+            }
+
+            string? dir = Path.GetDirectoryName(targetPath);
+            if (string.IsNullOrEmpty(dir)) return 0;
+
+            string tmpPath = targetPath + ".tmp." + Guid.NewGuid().ToString("N");
+            try
+            {
+                if (!Directory.Exists(dir))
+                {
+                    Directory.CreateDirectory(dir);
+                }
+
+                snapshot.WriteIpc(tmpPath);
+
+                if (Directory.Exists(dir))
+                {
+                    File.Move(tmpPath, targetPath, overwrite: true);
+
+                    using (entry.AcquireWriteLock())
+                    {
+                        if (entry.LastCommittedLsn == lsn)
+                        {
+                            entry.HasUnflushedCommittedChanges = false;
+                            if (entry.ActiveTransactionId != Guid.Empty)
+                            {
+                                entry.FirstUnflushedLsn = entry.FirstUncommittedTxLsn;
+                            }
+                            else
+                            {
+                                entry.FirstUnflushedLsn = 0;
+                                entry.IsDirty = false;
+                            }
+                        }
+                    }
+
+                    if (walWriter != null && lsn > 0)
+                    {
+                        Span<byte> lsnBytes = stackalloc byte[8];
+                        BitConverter.TryWriteBytes(lsnBytes, lsn);
+                        walWriter.AppendRecord(WalRecordType.CheckpointEnd, Guid.Empty, entry.TableName, lsnBytes);
+                    }
+
+                    return lsn;
+                }
+            }
+            catch (Exception ex) when (ex is UnauthorizedAccessException or DirectoryNotFoundException or IOException)
+            {
+                // Target directory may have been concurrently deleted or locked during cleanup
+            }
+            finally
+            {
+                if (File.Exists(tmpPath))
+                {
+                    try { File.Delete(tmpPath); } catch { }
+                }
+            }
+
+            return 0;
         }
 
         public void Clear()

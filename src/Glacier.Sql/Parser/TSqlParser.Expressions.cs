@@ -56,8 +56,19 @@ namespace Glacier.Sql.Parser
                     return new SqlLiteral(token.Text.Equals("TRUE", StringComparison.OrdinalIgnoreCase));
 
                 case TokenType.NumberLiteral:
-                    if (token.Text.Contains(".")) return new SqlLiteral(double.Parse(token.Text, CultureInfo.InvariantCulture));
-                    return new SqlLiteral(int.Parse(token.Text));
+                    if (token.Text.Contains('.'))
+                    {
+                        return new SqlLiteral(double.Parse(token.Text, CultureInfo.InvariantCulture));
+                    }
+                    if (long.TryParse(token.Text, NumberStyles.Integer, CultureInfo.InvariantCulture, out long longVal))
+                    {
+                        if (longVal >= int.MinValue && longVal <= int.MaxValue)
+                        {
+                            return new SqlLiteral((int)longVal);
+                        }
+                        return new SqlLiteral(longVal);
+                    }
+                    return new SqlLiteral(double.Parse(token.Text, CultureInfo.InvariantCulture));
 
                 case TokenType.StringLiteral:
                     return new SqlLiteral(token.Text);
@@ -66,7 +77,6 @@ namespace Glacier.Sql.Parser
                     return new SqlStarRef(null);
 
                 case TokenType.Identifier:
-                    // Check if it's a function call (identifier followed by open parenthesis)
                     if (Current.Type == TokenType.OpenParenthesis)
                     {
                         Consume(TokenType.OpenParenthesis);
@@ -83,8 +93,7 @@ namespace Glacier.Sql.Parser
                         Consume(TokenType.CloseParenthesis, "Expected ')' at end of function arguments");
                         return new SqlFunctionCall(token.Text, args);
                     }
-                    
-                    // Check for dotted identifiers (table.column or table.*)
+
                     if (Match(TokenType.Dot))
                     {
                         if (Match(TokenType.Star))
@@ -113,14 +122,45 @@ namespace Glacier.Sql.Parser
                     Consume(TokenType.CloseParenthesis, "Expected ')' after EXISTS subquery");
                     return new SqlExistsExpression(existsSub);
 
+                case TokenType.Plus:
+                    var plusOperand = ParseExpression(6);
+                    if (plusOperand is SqlLiteral plusLit && plusLit.Value is int or long or double)
+                    {
+                        return plusLit;
+                    }
+                    return new SqlUnaryExpression("+", plusOperand);
+
                 case TokenType.Minus:
-                    // Unary negate
-                    var operand = ParseExpression(6); // high precedence for unary minus
+                    var operand = ParseExpression(6);
+                    if (operand is SqlLiteral minusLit)
+                    {
+                        if (minusLit.Value is int mi)
+                        {
+                            long negInt = -(long)mi;
+                            return new SqlLiteral(negInt >= int.MinValue && negInt <= int.MaxValue ? (object)(int)negInt : negInt);
+                        }
+                        if (minusLit.Value is long ml)
+                        {
+                            if (ml == 2147483648L)
+                            {
+                                return new SqlLiteral(int.MinValue);
+                            }
+                            if (ml != long.MinValue)
+                            {
+                                long negLong = -ml;
+                                return new SqlLiteral(negLong >= int.MinValue && negLong <= int.MaxValue ? (object)(int)negLong : negLong);
+                            }
+                            return new SqlLiteral(-(double)ml);
+                        }
+                        if (minusLit.Value is double md)
+                        {
+                            return new SqlLiteral(-md);
+                        }
+                    }
                     return new SqlUnaryExpression("-", operand);
 
                 case TokenType.Not:
-                    // Unary logical NOT
-                    var logOperand = ParseExpression(2); // Logical NOT precedence
+                    var logOperand = ParseExpression(2);
                     return new SqlUnaryExpression("NOT", logOperand);
 
                 default:
@@ -135,7 +175,6 @@ namespace Glacier.Sql.Parser
 
             string opStr = opToken.Text;
 
-            // Handle IS NOT as a single operator
             if (opToken.Type == TokenType.Is && Match(TokenType.Not))
             {
                 opStr = "IS NOT";

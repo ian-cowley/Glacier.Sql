@@ -3,6 +3,7 @@
 [Oo]bj/
 [Ll]og/
 [Ll]ogs/
+BenchmarkDotNet.Artifacts/
 
 ## Visual Studio
 .vs/
@@ -20,6 +21,7 @@
 
 ## NuGet Packages
 *.nupkg
+*.snupkg
 packages/
 project.lock.json
 project.assets.json
@@ -28,10 +30,22 @@ project.assets.json
 TestResults/
 *.clog
 
-## User-specific and temporary files
+## Secrets & Environment Configuration (Zero Secrets Policy)
+appsettings*.json
+!appsettings.template.json
+*.env
+*.env.*
+!.env.example
+
+## Runtime Data, WAL & Temporary Files
+Data/
 *.tmp
+*.tmp.*
 *.temp
 *.log
 *catalog.json
 *.arrow
 *.ipc
+*.wal
+mcp_sql_log.txt
+critical_error.txt

@@ -1,11 +1,11 @@
 using System;
 using System.Collections.Generic;
-using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
 using Glacier.Polaris;
 using Glacier.Sql.Catalog;
 using Glacier.Sql.Parser;
+using Glacier.Sql.Storage.BufferPool;
 
 namespace Glacier.Sql.Engine
 {
@@ -32,42 +32,68 @@ namespace Glacier.Sql.Engine
     public class TransactionLockInfo
     {
         public string TableName { get; }
-        public bool Exclusive { get; }
-        public ThreadIndependentReaderWriterLock Lock { get; }
+        public bool Exclusive { get; private set; }
+        public AsyncReaderWriterLock Lock { get; }
+        public AsyncReaderWriterLock.LockReleaser Releaser { get; private set; }
 
-        public TransactionLockInfo(string tableName, bool exclusive, ThreadIndependentReaderWriterLock lk)
+        public TransactionLockInfo(
+            string tableName,
+            bool exclusive,
+            AsyncReaderWriterLock lk,
+            AsyncReaderWriterLock.LockReleaser releaser)
         {
             TableName = tableName;
             Exclusive = exclusive;
             Lock = lk;
+            Releaser = releaser;
+        }
+
+        internal void UpgradeToWrite(AsyncReaderWriterLock.LockReleaser writeReleaser)
+        {
+            Exclusive = true;
+            Releaser = writeReleaser;
         }
     }
 
     public class SqlTransaction
     {
-        public string TransactionId { get; } = Guid.NewGuid().ToString();
+        public Guid TransactionGuid { get; } = Guid.NewGuid();
+        public string TransactionId { get; }
         public bool IsActive { get; private set; } = true;
+
         private readonly List<Action> _rollbacks = new();
-        private readonly List<string> _backupFiles = new();
         private readonly List<TransactionLockInfo> _heldLocks = new();
         private readonly HashSet<string> _backedUpTables = new(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, TableBufferEntry> _mutatedEntries = new(StringComparer.OrdinalIgnoreCase);
+
+        public SqlTransaction()
+        {
+            TransactionId = TransactionGuid.ToString();
+        }
 
         public bool HasBackedUpTable(string tableName) => _backedUpTables.Contains(tableName);
         public void RegisterBackedUpTable(string tableName) => _backedUpTables.Add(tableName);
+
+        public void RegisterMutatedEntry(TableBufferEntry entry)
+        {
+            if (entry != null)
+            {
+                _mutatedEntries[entry.TableName] = entry;
+            }
+        }
 
         public void RegisterRollback(Action action)
         {
             _rollbacks.Add(action);
         }
 
-        public void RegisterBackupFile(string path)
+        public void RegisterLock(
+            string tableName,
+            bool exclusive,
+            AsyncReaderWriterLock lk,
+            AsyncReaderWriterLock.LockReleaser releaser)
         {
-            _backupFiles.Add(path);
-        }
-
-        public void RegisterLock(string tableName, bool exclusive, ThreadIndependentReaderWriterLock lk)
-        {
-            _heldLocks.Add(new TransactionLockInfo(tableName, exclusive, lk));
+            _heldLocks.Add(new TransactionLockInfo(tableName, exclusive, lk, releaser));
         }
 
         public TransactionLockInfo? GetHeldLock(string tableName)
@@ -80,63 +106,60 @@ namespace Glacier.Sql.Engine
             _heldLocks.RemoveAll(l => l.TableName.Equals(tableName, StringComparison.OrdinalIgnoreCase));
         }
 
-        public void Commit()
+        public void Commit(ulong commitLsn = 0)
         {
             IsActive = false;
-            _rollbacks.Clear();
-            foreach (var path in _backupFiles)
+
+            foreach (var entry in _mutatedEntries.Values)
             {
                 try
                 {
-                    if (File.Exists(path))
-                    {
-                        File.Delete(path);
-                    }
+                    entry.CommitTransaction(TransactionGuid, commitLsn);
                 }
                 catch { }
             }
-            _backupFiles.Clear();
 
-            // Release locks
-            foreach (var lockInfo in _heldLocks)
-            {
-                if (lockInfo.Exclusive)
-                {
-                    if (lockInfo.Lock.IsWriteLockHeld)
-                        lockInfo.Lock.ExitWriteLock();
-                }
-                else
-                {
-                    if (lockInfo.Lock.IsReadLockHeld)
-                        lockInfo.Lock.ExitReadLock();
-                }
-            }
-            _heldLocks.Clear();
+            _mutatedEntries.Clear();
+            _rollbacks.Clear();
+            _backedUpTables.Clear();
+
+            ReleaseHeldLocks();
         }
 
         public void Rollback()
         {
             IsActive = false;
+
+            foreach (var entry in _mutatedEntries.Values)
+            {
+                try
+                {
+                    entry.RollbackTransaction(TransactionGuid);
+                }
+                catch { }
+            }
+
             foreach (var action in _rollbacks)
             {
                 try { action(); } catch { }
             }
-            _rollbacks.Clear();
-            _backupFiles.Clear();
 
-            // Release locks
-            foreach (var lockInfo in _heldLocks)
+            _mutatedEntries.Clear();
+            _rollbacks.Clear();
+            _backedUpTables.Clear();
+
+            ReleaseHeldLocks();
+        }
+
+        private void ReleaseHeldLocks()
+        {
+            for (int i = _heldLocks.Count - 1; i >= 0; i--)
             {
-                if (lockInfo.Exclusive)
+                try
                 {
-                    if (lockInfo.Lock.IsWriteLockHeld)
-                        lockInfo.Lock.ExitWriteLock();
+                    _heldLocks[i].Releaser.Dispose();
                 }
-                else
-                {
-                    if (lockInfo.Lock.IsReadLockHeld)
-                        lockInfo.Lock.ExitReadLock();
-                }
+                catch { }
             }
             _heldLocks.Clear();
         }
@@ -144,44 +167,58 @@ namespace Glacier.Sql.Engine
 
     public interface IDatabaseLock : IDisposable { }
 
-    public class DatabaseLock : IDatabaseLock
+    public sealed class DatabaseLock : IDatabaseLock
     {
-        private readonly ThreadIndependentReaderWriterLock _lock;
-        private readonly bool _exclusive;
+        private readonly Action _onDispose;
         private bool _released;
 
-        public DatabaseLock(ThreadIndependentReaderWriterLock lk, bool exclusive)
+        public DatabaseLock(Action onDispose)
         {
-            _lock = lk;
-            _exclusive = exclusive;
-            if (exclusive)
-                _lock.EnterWriteLock();
-            else
-                _lock.EnterReadLock();
+            _onDispose = onDispose ?? throw new ArgumentNullException(nameof(onDispose));
+        }
+
+        public DatabaseLock(AsyncReaderWriterLock.LockReleaser releaser)
+        {
+            if (releaser == null) throw new ArgumentNullException(nameof(releaser));
+            _onDispose = releaser.Dispose;
         }
 
         public void Dispose()
         {
             if (!_released)
             {
-                if (_exclusive)
-                {
-                    if (_lock.IsWriteLockHeld)
-                        _lock.ExitWriteLock();
-                }
-                else
-                {
-                    if (_lock.IsReadLockHeld)
-                        _lock.ExitReadLock();
-                }
                 _released = true;
+                _onDispose();
             }
         }
     }
 
-    public class NullDatabaseLock : IDatabaseLock
+    public sealed class NullDatabaseLock : IDatabaseLock
     {
+        public static readonly NullDatabaseLock Instance = new();
         public void Dispose() { }
+    }
+
+    internal sealed class StatementLockState
+    {
+        public string TableName { get; }
+        public AsyncReaderWriterLock Lock { get; }
+        public AsyncReaderWriterLock.LockReleaser Releaser { get; set; }
+        public bool Exclusive { get; set; }
+        public int RefCount { get; set; }
+
+        public StatementLockState(
+            string tableName,
+            AsyncReaderWriterLock lk,
+            AsyncReaderWriterLock.LockReleaser releaser,
+            bool exclusive)
+        {
+            TableName = tableName;
+            Lock = lk;
+            Releaser = releaser;
+            Exclusive = exclusive;
+            RefCount = 1;
+        }
     }
 
     public class SqlTrigger
@@ -198,6 +235,9 @@ namespace Glacier.Sql.Engine
         public SqlTransaction? ActiveTransaction { get; set; }
         public List<SqlTrigger> Triggers { get; } = new();
 
+        internal readonly object StatementLockSync = new();
+        internal readonly Dictionary<string, StatementLockState> StatementLocks = new(StringComparer.OrdinalIgnoreCase);
+
         public ExecutionContext(CatalogManager catalog)
         {
             Catalog = catalog ?? throw new ArgumentNullException(nameof(catalog));
@@ -205,9 +245,9 @@ namespace Glacier.Sql.Engine
 
         public void DispatchTriggers(string tableName, string eventType, DataFrame rows)
         {
-            var matched = Triggers.Where(t => 
-                t.TableName.Equals(tableName, StringComparison.OrdinalIgnoreCase) && 
-                t.EventType.Equals(eventType, StringComparison.OrdinalIgnoreCase));
+            var matched = Triggers.Where(t =>
+                t.TableName.Equals(tableName, StringComparison.OrdinalIgnoreCase) &&
+                t.EventType.Equals(eventType, StringComparison.OrdinalIgnoreCase)).ToList();
 
             foreach (var trigger in matched)
             {
@@ -249,7 +289,12 @@ namespace Glacier.Sql.Engine
             }
         }
 
-        public async Task<ExecuteResult> ExecuteStatementAsync(SqlStatement stmt, ExecutionContext context, DataFrame? inserted = null, DataFrame? deleted = null, string? sqlText = null)
+        public async Task<ExecuteResult> ExecuteStatementAsync(
+            SqlStatement stmt,
+            ExecutionContext context,
+            DataFrame? inserted = null,
+            DataFrame? deleted = null,
+            string? sqlText = null)
         {
             try
             {
@@ -259,7 +304,7 @@ namespace Glacier.Sql.Engine
                         return ExecuteCreate(create, context);
 
                     case DropTableStatement drop:
-                        return ExecuteDrop(drop, context);
+                        return await ExecuteDrop(drop, context);
 
                     case AlterTableStatement alter:
                         return await ExecuteAlter(alter, context);

@@ -45,6 +45,65 @@ namespace Glacier.Sql.Parser
             return token;
         }
 
+        private static bool NeedsBrackets(string identifier)
+        {
+            if (string.IsNullOrEmpty(identifier) || SqlLexer.IsKeyword(identifier))
+            {
+                return true;
+            }
+
+            char first = identifier[0];
+            if (!char.IsLetter(first) && first != '_')
+            {
+                return true;
+            }
+
+            for (int i = 1; i < identifier.Length; i++)
+            {
+                char c = identifier[i];
+                if (!char.IsLetterOrDigit(c) && c != '_')
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private string ReconstructSqlFromTokens(int startIdx, int endIdx)
+        {
+            var sb = new StringBuilder();
+            for (int i = startIdx; i < endIdx && i < _tokens.Count; i++)
+            {
+                var t = _tokens[i];
+                if (t.Type == TokenType.EOF) break;
+
+                if (t.Type == TokenType.StringLiteral)
+                {
+                    sb.Append('\'').Append(t.Text.Replace("'", "''")).Append('\'');
+                }
+                else if (t.Type == TokenType.Identifier)
+                {
+                    if (NeedsBrackets(t.Text))
+                    {
+                        sb.Append('[').Append(t.Text).Append(']');
+                    }
+                    else
+                    {
+                        sb.Append(t.Text);
+                    }
+                }
+                else
+                {
+                    sb.Append(t.Text);
+                }
+
+                sb.Append(' ');
+            }
+
+            return sb.ToString().Trim();
+        }
+
         public SqlStatement Parse()
         {
             if (Current.Type == TokenType.Select)
@@ -103,7 +162,7 @@ namespace Glacier.Sql.Parser
                 return ParseCreateView();
             }
             Consume(TokenType.Table);
-            
+
             string tableName = Consume(TokenType.Identifier, "Expected table name after CREATE TABLE").Text;
             Consume(TokenType.OpenParenthesis, "Expected '(' after table name");
 
@@ -111,82 +170,15 @@ namespace Glacier.Sql.Parser
             while (true)
             {
                 string columnName = Consume(TokenType.Identifier, "Expected column name").Text;
-                
-                // Parse Data Type
-                string dataType;
-                if (Match(TokenType.Int)) dataType = "INT";
-                else if (Match(TokenType.Float)) dataType = "FLOAT";
-                else if (Match(TokenType.Varchar))
-                {
-                    dataType = "VARCHAR";
-                    if (Match(TokenType.OpenParenthesis))
-                    {
-                        // consume length or MAX
-                        if (Current.Type == TokenType.NumberLiteral || Current.Text.Equals("MAX", StringComparison.OrdinalIgnoreCase))
-                        {
-                            Read(); // consume number/MAX
-                        }
-                        Consume(TokenType.CloseParenthesis);
-                    }
-                }
-                else if (Match(TokenType.Bit)) dataType = "BIT";
-                else if (Match(TokenType.Datetime)) dataType = "DATETIME";
-                else
-                {
-                    throw new Exception($"Unsupported data type '{Current.Text}' for column '{columnName}'");
-                }
+
+                string dataType = ParseColumnDataType(columnName);
 
                 bool isNullable = true;
                 bool isPrimaryKey = false;
                 bool isUnique = false;
                 string? checkExpression = null;
 
-                while (true)
-                {
-                    if (Match(TokenType.Null))
-                    {
-                        isNullable = true;
-                    }
-                    else if (Match(TokenType.Not))
-                    {
-                        Consume(TokenType.Null, "Expected NULL after NOT");
-                        isNullable = false;
-                    }
-                    else if (Match(TokenType.Primary))
-                    {
-                        Consume(TokenType.Key, "Expected KEY after PRIMARY");
-                        isPrimaryKey = true;
-                        isNullable = false;
-                    }
-                    else if (Match(TokenType.Unique))
-                    {
-                        isUnique = true;
-                    }
-                    else if (Match(TokenType.Check))
-                    {
-                        Consume(TokenType.OpenParenthesis, "Expected '(' after CHECK");
-                        int checkStart = _position;
-                        var expr = ParseExpression(0);
-                        int checkEnd = _position;
-                        Consume(TokenType.CloseParenthesis, "Expected ')' to close CHECK constraint");
-
-                        var sbCheck = new StringBuilder();
-                        for (int i = checkStart; i < checkEnd; i++)
-                        {
-                            var t = _tokens[i];
-                            if (t.Type == TokenType.EOF) break;
-                            if (t.Type == TokenType.StringLiteral) sbCheck.Append("'").Append(t.Text.Replace("'", "''")).Append("'");
-                            else if (t.Type == TokenType.Identifier) sbCheck.Append(t.Text);
-                            else sbCheck.Append(t.Text);
-                            sbCheck.Append(" ");
-                        }
-                        checkExpression = sbCheck.ToString().Trim();
-                    }
-                    else
-                    {
-                        break;
-                    }
-                }
+                ParseInlineColumnConstraints(ref isNullable, ref isPrimaryKey, ref isUnique, ref checkExpression);
 
                 columns.Add(new ColumnDefinition(columnName, dataType, isNullable, isPrimaryKey, isUnique, checkExpression));
 
@@ -196,6 +188,68 @@ namespace Glacier.Sql.Parser
 
             Consume(TokenType.CloseParenthesis, "Expected ')' to close column definitions");
             return new CreateTableStatement(tableName, columns);
+        }
+
+        private string ParseColumnDataType(string columnName)
+        {
+            if (Match(TokenType.Int)) return "INT";
+            if (Match(TokenType.Float)) return "FLOAT";
+            if (Match(TokenType.Varchar))
+            {
+                if (Match(TokenType.OpenParenthesis))
+                {
+                    if (Current.Type == TokenType.NumberLiteral || Current.Text.Equals("MAX", StringComparison.OrdinalIgnoreCase))
+                    {
+                        Read();
+                    }
+                    Consume(TokenType.CloseParenthesis);
+                }
+                return "VARCHAR";
+            }
+            if (Match(TokenType.Bit)) return "BIT";
+            if (Match(TokenType.Datetime)) return "DATETIME";
+
+            throw new Exception($"Unsupported data type '{Current.Text}' for column '{columnName}'");
+        }
+
+        private void ParseInlineColumnConstraints(ref bool isNullable, ref bool isPrimaryKey, ref bool isUnique, ref string? checkExpression)
+        {
+            while (true)
+            {
+                if (Match(TokenType.Null))
+                {
+                    isNullable = true;
+                }
+                else if (Match(TokenType.Not))
+                {
+                    Consume(TokenType.Null, "Expected NULL after NOT");
+                    isNullable = false;
+                }
+                else if (Match(TokenType.Primary))
+                {
+                    Consume(TokenType.Key, "Expected KEY after PRIMARY");
+                    isPrimaryKey = true;
+                    isNullable = false;
+                }
+                else if (Match(TokenType.Unique))
+                {
+                    isUnique = true;
+                }
+                else if (Match(TokenType.Check))
+                {
+                    Consume(TokenType.OpenParenthesis, "Expected '(' after CHECK");
+                    int checkStart = _position;
+                    _ = ParseExpression(0);
+                    int checkEnd = _position;
+                    Consume(TokenType.CloseParenthesis, "Expected ')' to close CHECK constraint");
+
+                    checkExpression = ReconstructSqlFromTokens(checkStart, checkEnd);
+                }
+                else
+                {
+                    break;
+                }
+            }
         }
 
         private SqlStatement ParseCreateTrigger()
@@ -229,38 +283,10 @@ namespace Glacier.Sql.Parser
             Consume(TokenType.As, "Expected AS keyword before trigger body");
 
             int bodyStart = _position;
-            // Parse the inner statement to validate it
-            var actionStmt = Parse();
+            _ = Parse();
             int bodyEnd = _position;
 
-            var sb = new StringBuilder();
-            for (int i = bodyStart; i < bodyEnd; i++)
-            {
-                var t = _tokens[i];
-                if (t.Type == TokenType.EOF) break;
-                if (t.Type == TokenType.StringLiteral)
-                {
-                    sb.Append("'").Append(t.Text.Replace("'", "''")).Append("'");
-                }
-                else if (t.Type == TokenType.Identifier)
-                {
-                    if (t.Text.Contains(" ") || t.Text.Contains(".") || t.Text.Contains("-"))
-                    {
-                        sb.Append("[").Append(t.Text).Append("]");
-                    }
-                    else
-                    {
-                        sb.Append(t.Text);
-                    }
-                }
-                else
-                {
-                    sb.Append(t.Text);
-                }
-                sb.Append(" ");
-            }
-            string actionSql = sb.ToString().Trim();
-
+            string actionSql = ReconstructSqlFromTokens(bodyStart, bodyEnd);
             return new CreateTriggerStatement(triggerName, tableName, eventType, timing, actionSql);
         }
 
@@ -285,95 +311,24 @@ namespace Glacier.Sql.Parser
 
             if (Match(TokenType.Add))
             {
-                if (Match(TokenType.Column))
-                {
-                }
-                
+                Match(TokenType.Column);
+
                 string columnName = Consume(TokenType.Identifier, "Expected column name to add").Text;
-                
-                // Parse Data Type
-                string dataType;
-                if (Match(TokenType.Int)) dataType = "INT";
-                else if (Match(TokenType.Float)) dataType = "FLOAT";
-                else if (Match(TokenType.Varchar))
-                {
-                    dataType = "VARCHAR";
-                    if (Match(TokenType.OpenParenthesis))
-                    {
-                        if (Current.Type == TokenType.NumberLiteral || Current.Text.Equals("MAX", StringComparison.OrdinalIgnoreCase))
-                        {
-                            Read();
-                        }
-                        Consume(TokenType.CloseParenthesis);
-                    }
-                }
-                else if (Match(TokenType.Bit)) dataType = "BIT";
-                else if (Match(TokenType.Datetime)) dataType = "DATETIME";
-                else
-                {
-                    throw new Exception($"Unsupported data type '{Current.Text}' for new column '{columnName}'");
-                }
+                string dataType = ParseColumnDataType(columnName);
 
                 bool isNullable = true;
                 bool isPrimaryKey = false;
                 bool isUnique = false;
                 string? checkExpression = null;
 
-                while (true)
-                {
-                    if (Match(TokenType.Null))
-                    {
-                        isNullable = true;
-                    }
-                    else if (Match(TokenType.Not))
-                    {
-                        Consume(TokenType.Null, "Expected NULL after NOT");
-                        isNullable = false;
-                    }
-                    else if (Match(TokenType.Primary))
-                    {
-                        Consume(TokenType.Key, "Expected KEY after PRIMARY");
-                        isPrimaryKey = true;
-                        isNullable = false;
-                    }
-                    else if (Match(TokenType.Unique))
-                    {
-                        isUnique = true;
-                    }
-                    else if (Match(TokenType.Check))
-                    {
-                        Consume(TokenType.OpenParenthesis, "Expected '(' after CHECK");
-                        int checkStart = _position;
-                        var expr = ParseExpression(0);
-                        int checkEnd = _position;
-                        Consume(TokenType.CloseParenthesis, "Expected ')' to close CHECK constraint");
-
-                        var sbCheck = new StringBuilder();
-                        for (int i = checkStart; i < checkEnd; i++)
-                        {
-                            var t = _tokens[i];
-                            if (t.Type == TokenType.EOF) break;
-                            if (t.Type == TokenType.StringLiteral) sbCheck.Append("'").Append(t.Text.Replace("'", "''")).Append("'");
-                            else if (t.Type == TokenType.Identifier) sbCheck.Append(t.Text);
-                            else sbCheck.Append(t.Text);
-                            sbCheck.Append(" ");
-                        }
-                        checkExpression = sbCheck.ToString().Trim();
-                    }
-                    else
-                    {
-                        break;
-                    }
-                }
+                ParseInlineColumnConstraints(ref isNullable, ref isPrimaryKey, ref isUnique, ref checkExpression);
 
                 var colDef = new ColumnDefinition(columnName, dataType, isNullable, isPrimaryKey, isUnique, checkExpression);
                 return new AlterTableStatement(tableName, "ADD", columnName, dataType, colDef);
             }
             else if (Match(TokenType.Drop))
             {
-                if (Match(TokenType.Column))
-                {
-                }
+                Match(TokenType.Column);
                 string columnName = Consume(TokenType.Identifier, "Expected column name to drop").Text;
                 return new AlterTableStatement(tableName, "DROP", columnName, null);
             }
@@ -393,18 +348,7 @@ namespace Glacier.Sql.Parser
             var selectQuery = (SelectStatement)ParseSelect();
             int selectEnd = _position;
 
-            var sbSelect = new StringBuilder();
-            for (int i = selectStart; i < selectEnd; i++)
-            {
-                var t = _tokens[i];
-                if (t.Type == TokenType.EOF) break;
-                if (t.Type == TokenType.StringLiteral) sbSelect.Append("'").Append(t.Text.Replace("'", "''")).Append("'");
-                else if (t.Type == TokenType.Identifier) sbSelect.Append(t.Text);
-                else sbSelect.Append(t.Text);
-                sbSelect.Append(" ");
-            }
-            string definitionSql = sbSelect.ToString().Trim();
-
+            string definitionSql = ReconstructSqlFromTokens(selectStart, selectEnd);
             return new CreateViewStatement(viewName, selectQuery, definitionSql);
         }
     }

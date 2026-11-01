@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
-using System.Text;
+using System.Globalization;
+using System.Linq;
 using System.Threading.Tasks;
 using Glacier.Polaris;
 using Glacier.Polaris.Data;
@@ -12,6 +13,112 @@ namespace Glacier.Sql.Engine
 {
     public partial class SqlEngine
     {
+        private static object? EvaluateInsertExpression(SqlExpression expr)
+        {
+            switch (expr)
+            {
+                case SqlLiteral lit:
+                    return lit.Value;
+
+                case SqlUnaryExpression unary:
+                {
+                    object? operand = EvaluateInsertExpression(unary.Operand);
+                    if (operand == null) return null;
+
+                    if (unary.Operator == "-")
+                    {
+                        if (operand is int i) return checked(-i);
+                        if (operand is long l)
+                        {
+                            if (l == 2147483648L) return int.MinValue;
+                            return checked(-l);
+                        }
+                        if (operand is double d) return -d;
+                        if (operand is float f) return -f;
+                        return -Convert.ToDouble(operand, CultureInfo.InvariantCulture);
+                    }
+                    if (unary.Operator == "+")
+                    {
+                        if (operand is int or long or double or float) return operand;
+                        return Convert.ToDouble(operand, CultureInfo.InvariantCulture);
+                    }
+                    if (unary.Operator.Equals("NOT", StringComparison.OrdinalIgnoreCase))
+                    {
+                        return !Convert.ToBoolean(operand, CultureInfo.InvariantCulture);
+                    }
+
+                    throw new NotSupportedException($"Unsupported unary operator '{unary.Operator}' in INSERT VALUES.");
+                }
+
+                case SqlBinaryExpression bin:
+                {
+                    object? left = EvaluateInsertExpression(bin.Left);
+                    object? right = EvaluateInsertExpression(bin.Right);
+                    if (left == null || right == null) return null;
+
+                    if (bin.Operator == "+" && (left is string || right is string))
+                    {
+                        return Convert.ToString(left, CultureInfo.InvariantCulture) + Convert.ToString(right, CultureInfo.InvariantCulture);
+                    }
+
+                    if ((left is int or long) && (right is int or long))
+                    {
+                        long l = Convert.ToInt64(left, CultureInfo.InvariantCulture);
+                        long r = Convert.ToInt64(right, CultureInfo.InvariantCulture);
+                        long res = bin.Operator switch
+                        {
+                            "+" => checked(l + r),
+                            "-" => checked(l - r),
+                            "*" => checked(l * r),
+                            "/" => l / r,
+                            _ => throw new NotSupportedException($"Unsupported binary operator '{bin.Operator}' in INSERT VALUES.")
+                        };
+                        return res >= int.MinValue && res <= int.MaxValue ? (int)res : res;
+                    }
+
+                    double dl = Convert.ToDouble(left, CultureInfo.InvariantCulture);
+                    double dr = Convert.ToDouble(right, CultureInfo.InvariantCulture);
+                    return bin.Operator switch
+                    {
+                        "+" => dl + dr,
+                        "-" => dl - dr,
+                        "*" => dl * dr,
+                        "/" => dl / dr,
+                        _ => throw new NotSupportedException($"Unsupported binary operator '{bin.Operator}' in INSERT VALUES.")
+                    };
+                }
+
+                case SqlFunctionCall fn:
+                {
+                    string name = fn.FunctionName.ToUpperInvariant();
+                    if (name == "GETDATE")
+                    {
+                        return DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                    }
+
+                    var args = fn.Arguments.Select(EvaluateInsertExpression).ToList();
+                    if (args.Any(a => a == null)) return null;
+
+                    return name switch
+                    {
+                        "UPPER" when args.Count == 1 => Convert.ToString(args[0], CultureInfo.InvariantCulture)?.ToUpperInvariant(),
+                        "LOWER" when args.Count == 1 => Convert.ToString(args[0], CultureInfo.InvariantCulture)?.ToLowerInvariant(),
+                        "LEN" when args.Count == 1 => Convert.ToString(args[0], CultureInfo.InvariantCulture)?.Length ?? 0,
+                        "ABS" when args.Count == 1 => args[0] is int ai ? Math.Abs(ai) : Math.Abs(Convert.ToDouble(args[0], CultureInfo.InvariantCulture)),
+                        "SQRT" when args.Count == 1 => Math.Sqrt(Convert.ToDouble(args[0], CultureInfo.InvariantCulture)),
+                        "ROUND" when args.Count == 1 => Math.Round(Convert.ToDouble(args[0], CultureInfo.InvariantCulture)),
+                        "ROUND" when args.Count == 2 => Math.Round(
+                            Convert.ToDouble(args[0], CultureInfo.InvariantCulture),
+                            Convert.ToInt32(args[1], CultureInfo.InvariantCulture)),
+                        _ => throw new NotSupportedException($"Unsupported function '{fn.FunctionName}' in INSERT VALUES.")
+                    };
+                }
+
+                default:
+                    throw new NotSupportedException($"Unsupported expression '{expr.GetType().Name}' in INSERT statements.");
+            }
+        }
+
         private async Task<ExecuteResult> ExecuteInsert(InsertStatement insert, ExecutionContext context)
         {
             var catalog = context.Catalog;
@@ -21,9 +128,6 @@ namespace Glacier.Sql.Engine
                 return ExecuteResult.Error($"Table '{insert.TableName}' does not exist.");
             }
 
-            // Load existing table data via buffer pool
-            var bufferEntry = catalog.BufferPool.GetOrLoad(meta);
-
             // Parse and map insert values
             int targetColCount = insert.Columns?.Count ?? meta.Columns.Count;
             if (insert.Values.Count != targetColCount)
@@ -31,19 +135,13 @@ namespace Glacier.Sql.Engine
                 return ExecuteResult.Error($"Column count ({targetColCount}) does not match value count ({insert.Values.Count}).");
             }
 
-            // Create a mapping from column name to value
+            // Create a mapping from column name to evaluated constant value
             var valMap = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
             for (int i = 0; i < targetColCount; i++)
             {
                 string colName = insert.Columns != null ? insert.Columns[i] : meta.Columns[i].Name;
                 var expr = insert.Values[i];
-
-                if (expr is not SqlLiteral lit)
-                {
-                    throw new NotSupportedException("Only literal values are supported in INSERT statements currently.");
-                }
-
-                valMap[colName] = lit.Value;
+                valMap[colName] = EvaluateInsertExpression(expr);
             }
 
             // Construct single-row DataFrame
@@ -93,36 +191,44 @@ namespace Glacier.Sql.Engine
 
             var newRowDf = new DataFrame(newSeriesList);
 
-            // Check INSTEAD OF triggers
+            // Check INSTEAD OF triggers before mutating physical table
             if (HasInsteadOfTrigger(insert.TableName, "INSERT", context))
             {
                 await RunTriggersAsync(insert.TableName, "INSERT", "INSTEAD OF", newRowDf, null, context);
                 return ExecuteResult.Ok("1 row inserted (handled by INSTEAD OF trigger).", 1);
             }
 
-            using (AcquireLock(insert.TableName, true, context))
+            using (await AcquireLockAsync(insert.TableName, exclusive: true, context))
             {
-                // Transaction rollback in-memory snapshot support
-                BackupForTransaction(meta, catalog, context, bufferEntry);
+                var liveMeta = catalog.GetTable(insert.TableName);
+                if (liveMeta == null)
+                {
+                    return ExecuteResult.Error($"Table '{insert.TableName}' does not exist.");
+                }
 
-                var currentDf = bufferEntry.CurrentSnapshot;
+                var bufferEntry = catalog.BufferPool.GetOrLoad(liveMeta);
+                DataFrame currentDf;
+                using (bufferEntry.AcquireReadLock())
+                {
+                    currentDf = bufferEntry.CurrentSnapshot;
+                }
 
-                // Concatenate in memory
+                // Concatenate in memory under exclusive table lock
                 var mergedDf = DataFrame.Concat(new[] { currentDf, newRowDf });
 
-                // Validate constraints
-                await ValidateConstraintsAsync(meta, mergedDf, context);
+                // Validate constraints under exclusive table lock
+                await ValidateConstraintsAsync(liveMeta, mergedDf, context);
 
-                // Update in-memory Buffer Pool and append to WAL
+                // Register transaction rollback state before applying mutation
+                BackupForTransaction(liveMeta, catalog, context, bufferEntry);
+
+                // Update in-memory Buffer Pool and append physical Arrow IPC delta to WAL
                 using (bufferEntry.AcquireWriteLock())
                 {
-                    bufferEntry.CurrentSnapshot = mergedDf;
-                    bufferEntry.IsDirty = true;
-
                     byte[] payload = TableStorage.SerializeDataFrame(newRowDf);
-                    Guid txId = context.ActiveTransaction != null ? Guid.Parse(context.ActiveTransaction.TransactionId) : Guid.Empty;
+                    Guid txId = context.ActiveTransaction?.TransactionGuid ?? Guid.Empty;
                     ulong lsn = catalog.WalWriter.AppendRecord(WalRecordType.RowInsert, txId, insert.TableName, payload);
-                    bufferEntry.LastAppliedLsn = lsn;
+                    bufferEntry.ApplyMutation(mergedDf, lsn, txId);
                 }
 
                 // Dispatch AFTER insert triggers
@@ -132,96 +238,107 @@ namespace Glacier.Sql.Engine
             }
         }
 
-        private async Task<ExecuteResult> ExecuteSelect(SelectStatement select, ExecutionContext context, DataFrame? inserted = null, DataFrame? deleted = null)
+        private async Task<ExecuteResult> ExecuteSelect(
+            SelectStatement select,
+            ExecutionContext context,
+            DataFrame? inserted = null,
+            DataFrame? deleted = null)
         {
-            var selectLocks = AcquireSelectLocks(select, false, context);
-            try
+            var lockRequests = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+            CollectSelectLockRequests(select, context.Catalog, lockRequests, exclusive: false);
+
+            using (await AcquireTableLocksAsync(lockRequests, context))
             {
                 var lazy = _planner.PlanQuery(select, inserted, deleted);
                 var resultDf = await lazy.Collect();
                 return ExecuteResult.Query(resultDf);
             }
-            finally
-            {
-                foreach (var lk in selectLocks) lk.Dispose();
-            }
         }
 
         private async Task<ExecuteResult> ExecuteDelete(DeleteStatement delete, ExecutionContext context, string? sqlText = null)
         {
+            _ = sqlText;
             var catalog = context.Catalog;
-            var meta = catalog.GetTable(delete.TableName);
-            if (meta == null)
+            if (!catalog.TableExists(delete.TableName))
             {
                 return ExecuteResult.Error($"Table '{delete.TableName}' does not exist.");
             }
 
-            var bufferEntry = catalog.BufferPool.GetOrLoad(meta);
-            var df = bufferEntry.CurrentSnapshot;
-            int originalRowCount = df.RowCount;
-
-            if (originalRowCount == 0)
+            var lockRequests = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase)
             {
-                return ExecuteResult.Ok("0 rows deleted.", 0);
+                [delete.TableName] = true
+            };
+            if (delete.Where != null)
+            {
+                CollectExpressionLockRequests(delete.Where, catalog, lockRequests);
             }
 
-            DataFrame deletedRowsDf;
-            DataFrame filteredDf;
-            int deletedCount = 0;
-
-            if (delete.Where == null)
+            using (await AcquireTableLocksAsync(lockRequests, context))
             {
-                deletedRowsDf = df;
-                deletedCount = originalRowCount;
-                var emptyCols = df.Columns.Select(col => col.CloneEmpty(0)).ToList();
-                filteredDf = new DataFrame(emptyCols);
-            }
-            else
-            {
-                var conditionExpr = _planner.CompileExpression(delete.Where, delete.TableName);
-                var keepExpr = conditionExpr.IsNull() | (conditionExpr == Expr.Lit(false));
-                
-                deletedRowsDf = await df.Lazy().Filter(conditionExpr).Collect();
-                deletedCount = deletedRowsDf.RowCount;
-                
-                if (deletedCount > 0)
+                var meta = catalog.GetTable(delete.TableName);
+                if (meta == null)
                 {
-                    filteredDf = await df.Lazy().Filter(keepExpr).Collect();
+                    return ExecuteResult.Error($"Table '{delete.TableName}' does not exist.");
+                }
+
+                var bufferEntry = catalog.BufferPool.GetOrLoad(meta);
+                DataFrame df;
+                using (bufferEntry.AcquireReadLock())
+                {
+                    df = bufferEntry.CurrentSnapshot;
+                }
+
+                int originalRowCount = df.RowCount;
+                if (originalRowCount == 0)
+                {
+                    return ExecuteResult.Ok("0 rows deleted.", 0);
+                }
+
+                DataFrame deletedRowsDf;
+                DataFrame filteredDf;
+                int deletedCount;
+
+                if (delete.Where == null)
+                {
+                    deletedRowsDf = df;
+                    deletedCount = originalRowCount;
+                    var emptyCols = df.Columns.Select(col => col.CloneEmpty(0)).ToList();
+                    filteredDf = new DataFrame(emptyCols);
                 }
                 else
                 {
-                    filteredDf = df;
+                    var conditionExpr = _planner.CompileExpression(delete.Where, delete.TableName);
+                    var keepExpr = conditionExpr.IsNull() | (conditionExpr == Expr.Lit(false));
+
+                    deletedRowsDf = await df.Lazy().Filter(conditionExpr).Collect();
+                    deletedCount = deletedRowsDf.RowCount;
+
+                    filteredDf = deletedCount > 0
+                        ? await df.Lazy().Filter(keepExpr).Collect()
+                        : df;
                 }
-            }
 
-            if (deletedCount == 0)
-            {
-                return ExecuteResult.Ok("0 rows deleted.", 0);
-            }
+                if (deletedCount == 0)
+                {
+                    return ExecuteResult.Ok("0 rows deleted.", 0);
+                }
 
-            // Check INSTEAD OF triggers
-            if (HasInsteadOfTrigger(delete.TableName, "DELETE", context))
-            {
-                await RunTriggersAsync(delete.TableName, "DELETE", "INSTEAD OF", null, deletedRowsDf, context);
-                return ExecuteResult.Ok($"{deletedCount} row(s) deleted (handled by INSTEAD OF trigger).", deletedCount);
-            }
+                // Check INSTEAD OF triggers
+                if (HasInsteadOfTrigger(delete.TableName, "DELETE", context))
+                {
+                    await RunTriggersAsync(delete.TableName, "DELETE", "INSTEAD OF", null, deletedRowsDf, context);
+                    return ExecuteResult.Ok($"{deletedCount} row(s) deleted (handled by INSTEAD OF trigger).", deletedCount);
+                }
 
-            using (AcquireLock(delete.TableName, true, context))
-            {
-                // Transaction rollback in-memory snapshot support
                 BackupForTransaction(meta, catalog, context, bufferEntry);
 
-                // Update in-memory buffer pool and append to WAL
+                // Update in-memory buffer pool and append deterministic Arrow IPC post-delete snapshot to WAL
                 using (bufferEntry.AcquireWriteLock())
                 {
-                    bufferEntry.CurrentSnapshot = filteredDf;
-                    bufferEntry.IsDirty = true;
-
-                    string delText = sqlText ?? (delete.Where != null ? $"DELETE FROM {delete.TableName} WHERE {delete.Where}" : $"DELETE FROM {delete.TableName}");
-                    byte[] payload = Encoding.UTF8.GetBytes(delText);
-                    Guid txId = context.ActiveTransaction != null ? Guid.Parse(context.ActiveTransaction.TransactionId) : Guid.Empty;
+                    byte[] payload = TableStorage.SerializeDataFrame(filteredDf);
+                    Guid txId = context.ActiveTransaction?.TransactionGuid ?? Guid.Empty;
                     ulong lsn = catalog.WalWriter.AppendRecord(WalRecordType.RowDelete, txId, delete.TableName, payload);
-                    bufferEntry.LastAppliedLsn = lsn;
+                    bufferEntry.ApplyMutation(filteredDf, lsn, txId);
                 }
 
                 // Dispatch AFTER delete triggers
@@ -233,86 +350,110 @@ namespace Glacier.Sql.Engine
 
         private async Task<ExecuteResult> ExecuteUpdate(UpdateStatement update, ExecutionContext context, string? sqlText = null)
         {
+            _ = sqlText;
             var catalog = context.Catalog;
-            var meta = catalog.GetTable(update.TableName);
-            if (meta == null)
+            if (!catalog.TableExists(update.TableName))
             {
                 return ExecuteResult.Error($"Table '{update.TableName}' does not exist.");
             }
 
-            var bufferEntry = catalog.BufferPool.GetOrLoad(meta);
-            var df = bufferEntry.CurrentSnapshot;
-            int originalRowCount = df.RowCount;
-
-            if (originalRowCount == 0)
+            var lockRequests = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase)
             {
-                return ExecuteResult.Ok("0 rows updated.", 0);
+                [update.TableName] = true
+            };
+            if (update.Where != null)
+            {
+                CollectExpressionLockRequests(update.Where, catalog, lockRequests);
+            }
+            foreach (var assignment in update.Assignments)
+            {
+                CollectExpressionLockRequests(assignment.Expression, catalog, lockRequests);
             }
 
-            // Compile the condition
-            var conditionExpr = update.Where != null 
-                ? _planner.CompileExpression(update.Where, update.TableName)
-                : Expr.Lit(true);
-
-            // Get rows before update (deleted)
-            var deletedRowsDf = await df.Lazy().Filter(conditionExpr).Collect();
-            int updatedCount = deletedRowsDf.RowCount;
-
-            if (updatedCount == 0)
+            using (await AcquireTableLocksAsync(lockRequests, context))
             {
-                return ExecuteResult.Ok("0 rows updated.", 0);
-            }
-
-            // Build select projections to perform update
-            var updateMap = update.Assignments.ToDictionary(a => a.ColumnName, a => a.Expression, StringComparer.OrdinalIgnoreCase);
-            var projections = new List<Expr>();
-
-            foreach (var col in meta.Columns)
-            {
-                if (updateMap.TryGetValue(col.Name, out var assignExpr))
+                var meta = catalog.GetTable(update.TableName);
+                if (meta == null)
                 {
-                    var valExpr = _planner.CompileExpression(assignExpr, update.TableName);
-                    var condProj = Expr.When(conditionExpr).Then(valExpr).Otherwise(Expr.Col(col.Name)).Alias(col.Name);
-                    projections.Add(condProj);
+                    return ExecuteResult.Error($"Table '{update.TableName}' does not exist.");
                 }
-                else
+
+                var bufferEntry = catalog.BufferPool.GetOrLoad(meta);
+                DataFrame df;
+                using (bufferEntry.AcquireReadLock())
                 {
-                    projections.Add(Expr.Col(col.Name).Alias(col.Name));
+                    df = bufferEntry.CurrentSnapshot;
                 }
-            }
 
-            // Run lazy projection to update the values
-            var updatedDf = await df.Lazy().Select(projections.ToArray()).Collect();
-            
-            // Validate constraints
-            await ValidateConstraintsAsync(meta, updatedDf, context);
+                if (df.RowCount == 0)
+                {
+                    return ExecuteResult.Ok("0 rows updated.", 0);
+                }
 
-            // Get rows after update (inserted)
-            var insertedRowsDf = await updatedDf.Lazy().Filter(conditionExpr).Collect();
+                var conditionExpr = update.Where != null
+                    ? _planner.CompileExpression(update.Where, update.TableName)
+                    : Expr.Lit(true);
 
-            // Check INSTEAD OF triggers
-            if (HasInsteadOfTrigger(update.TableName, "UPDATE", context))
-            {
-                await RunTriggersAsync(update.TableName, "UPDATE", "INSTEAD OF", insertedRowsDf, deletedRowsDf, context);
-                return ExecuteResult.Ok($"{updatedCount} row(s) updated (handled by INSTEAD OF trigger).", updatedCount);
-            }
+                // Get rows before update (deleted)
+                var deletedRowsDf = await df.Lazy().Filter(conditionExpr).Collect();
+                int updatedCount = deletedRowsDf.RowCount;
 
-            using (AcquireLock(update.TableName, true, context))
-            {
-                // Transaction rollback in-memory snapshot support
+                if (updatedCount == 0)
+                {
+                    return ExecuteResult.Ok("0 rows updated.", 0);
+                }
+
+                var updateMap = update.Assignments.ToDictionary(a => a.ColumnName, a => a.Expression, StringComparer.OrdinalIgnoreCase);
+                var tableProjections = new List<Expr>(meta.Columns.Count);
+                var insertedProjections = new List<Expr>(meta.Columns.Count);
+
+                foreach (var col in meta.Columns)
+                {
+                    if (updateMap.TryGetValue(col.Name, out var assignExpr))
+                    {
+                        Expr valExpr;
+                        string colDt = col.DataType.ToUpperInvariant();
+                        if ((colDt == "BIT" || colDt == "BOOLEAN") && assignExpr is SqlLiteral { Value: int bitLit })
+                        {
+                            valExpr = Expr.Lit(bitLit != 0);
+                        }
+                        else
+                        {
+                            valExpr = _planner.CompileExpression(assignExpr, update.TableName);
+                        }
+                        tableProjections.Add(Expr.When(conditionExpr).Then(valExpr).Otherwise(Expr.Col(col.Name)).Alias(col.Name));
+                        insertedProjections.Add(valExpr.Alias(col.Name));
+                    }
+                    else
+                    {
+                        tableProjections.Add(Expr.Col(col.Name).Alias(col.Name));
+                        insertedProjections.Add(Expr.Col(col.Name).Alias(col.Name));
+                    }
+                }
+
+                // Compute updated table snapshot and validate constraints under exclusive lock
+                var updatedDf = await df.Lazy().Select(tableProjections.ToArray()).Collect();
+                await ValidateConstraintsAsync(meta, updatedDf, context);
+
+                // Compute exact post-update rows from matched pre-update rows (accurate even if WHERE column changed)
+                var insertedRowsDf = await deletedRowsDf.Lazy().Select(insertedProjections.ToArray()).Collect();
+
+                // Check INSTEAD OF triggers
+                if (HasInsteadOfTrigger(update.TableName, "UPDATE", context))
+                {
+                    await RunTriggersAsync(update.TableName, "UPDATE", "INSTEAD OF", insertedRowsDf, deletedRowsDf, context);
+                    return ExecuteResult.Ok($"{updatedCount} row(s) updated (handled by INSTEAD OF trigger).", updatedCount);
+                }
+
                 BackupForTransaction(meta, catalog, context, bufferEntry);
 
-                // Update in-memory buffer pool and append to WAL
+                // Update in-memory buffer pool and append deterministic Arrow IPC post-update snapshot to WAL
                 using (bufferEntry.AcquireWriteLock())
                 {
-                    bufferEntry.CurrentSnapshot = updatedDf;
-                    bufferEntry.IsDirty = true;
-
-                    string updText = sqlText ?? $"UPDATE {update.TableName}";
-                    byte[] payload = Encoding.UTF8.GetBytes(updText);
-                    Guid txId = context.ActiveTransaction != null ? Guid.Parse(context.ActiveTransaction.TransactionId) : Guid.Empty;
+                    byte[] payload = TableStorage.SerializeDataFrame(updatedDf);
+                    Guid txId = context.ActiveTransaction?.TransactionGuid ?? Guid.Empty;
                     ulong lsn = catalog.WalWriter.AppendRecord(WalRecordType.RowUpdate, txId, update.TableName, payload);
-                    bufferEntry.LastAppliedLsn = lsn;
+                    bufferEntry.ApplyMutation(updatedDf, lsn, txId);
                 }
 
                 // Dispatch AFTER update triggers
@@ -322,93 +463,95 @@ namespace Glacier.Sql.Engine
             }
         }
 
-        private async Task<ExecuteResult> ExecuteInsertSelect(InsertSelectStatement insertSelect, ExecutionContext context, DataFrame? inserted = null, DataFrame? deleted = null)
+        private async Task<ExecuteResult> ExecuteInsertSelect(
+            InsertSelectStatement insertSelect,
+            ExecutionContext context,
+            DataFrame? inserted = null,
+            DataFrame? deleted = null)
         {
             var catalog = context.Catalog;
-            var meta = catalog.GetTable(insertSelect.TableName);
-            if (meta == null)
+            if (!catalog.TableExists(insertSelect.TableName))
             {
                 return ExecuteResult.Error($"Table '{insertSelect.TableName}' does not exist.");
             }
 
-            // 1. Execute SELECT query
-            var lazy = _planner.PlanQuery(insertSelect.SelectQuery, inserted, deleted);
-            var selectDf = await lazy.Collect();
-
-            if (selectDf.RowCount == 0)
+            var lockRequests = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase)
             {
-                return ExecuteResult.Ok("0 rows inserted.", 0);
-            }
+                [insertSelect.TableName] = true
+            };
+            CollectSelectLockRequests(insertSelect.SelectQuery, catalog, lockRequests, exclusive: false);
 
-            // 2. Map and align columns
-            int targetColCount = insertSelect.Columns?.Count ?? meta.Columns.Count;
-            if (selectDf.Columns.Count != targetColCount)
+            using (await AcquireTableLocksAsync(lockRequests, context))
             {
-                return ExecuteResult.Error($"Column count in SELECT ({selectDf.Columns.Count}) does not match target column count ({targetColCount}).");
-            }
-
-            var newSeriesList = new List<ISeries>();
-            for (int targetIdx = 0; targetIdx < meta.Columns.Count; targetIdx++)
-            {
-                var targetCol = meta.Columns[targetIdx];
-                int sourceIdx = -1;
-                if (insertSelect.Columns != null)
+                var meta = catalog.GetTable(insertSelect.TableName);
+                if (meta == null)
                 {
-                    sourceIdx = insertSelect.Columns.FindIndex(c => c.Equals(targetCol.Name, StringComparison.OrdinalIgnoreCase));
-                }
-                else
-                {
-                    sourceIdx = targetIdx;
+                    return ExecuteResult.Error($"Table '{insertSelect.TableName}' does not exist.");
                 }
 
-                if (sourceIdx == -1)
+                // 1. Execute SELECT query under acquired table locks
+                var lazy = _planner.PlanQuery(insertSelect.SelectQuery, inserted, deleted);
+                var selectDf = await lazy.Collect();
+
+                if (selectDf.RowCount == 0)
                 {
-                    newSeriesList.Add(CreateNullSeries(targetCol.Name, targetCol.DataType, selectDf.RowCount));
+                    return ExecuteResult.Ok("0 rows inserted.", 0);
                 }
-                else
+
+                // 2. Map and align columns
+                int targetColCount = insertSelect.Columns?.Count ?? meta.Columns.Count;
+                if (selectDf.Columns.Count != targetColCount)
                 {
-                    newSeriesList.Add(ConvertSeries(selectDf.Columns[sourceIdx], targetCol.Name, targetCol.DataType));
+                    return ExecuteResult.Error($"Column count in SELECT ({selectDf.Columns.Count}) does not match target column count ({targetColCount}).");
                 }
-            }
 
-            var newRowsDf = new DataFrame(newSeriesList);
+                var newSeriesList = new List<ISeries>(meta.Columns.Count);
+                for (int targetIdx = 0; targetIdx < meta.Columns.Count; targetIdx++)
+                {
+                    var targetCol = meta.Columns[targetIdx];
+                    int sourceIdx = insertSelect.Columns != null
+                        ? insertSelect.Columns.FindIndex(c => c.Equals(targetCol.Name, StringComparison.OrdinalIgnoreCase))
+                        : targetIdx;
 
-            // Check INSTEAD OF triggers
-            if (HasInsteadOfTrigger(insertSelect.TableName, "INSERT", context))
-            {
-                await RunTriggersAsync(insertSelect.TableName, "INSERT", "INSTEAD OF", newRowsDf, null, context);
-                return ExecuteResult.Ok($"{newRowsDf.RowCount} row(s) inserted (handled by INSTEAD OF trigger).", newRowsDf.RowCount);
-            }
+                    if (sourceIdx == -1)
+                    {
+                        newSeriesList.Add(CreateNullSeries(targetCol.Name, targetCol.DataType, selectDf.RowCount));
+                    }
+                    else
+                    {
+                        newSeriesList.Add(ConvertSeries(selectDf.Columns[sourceIdx], targetCol.Name, targetCol.DataType));
+                    }
+                }
 
-            // Load existing table data via buffer pool
-            var bufferEntry = catalog.BufferPool.GetOrLoad(meta);
+                var newRowsDf = new DataFrame(newSeriesList);
 
-            using (AcquireLock(insertSelect.TableName, true, context))
-            {
-                // Transaction rollback in-memory snapshot support
-                BackupForTransaction(meta, catalog, context, bufferEntry);
+                // Check INSTEAD OF triggers
+                if (HasInsteadOfTrigger(insertSelect.TableName, "INSERT", context))
+                {
+                    await RunTriggersAsync(insertSelect.TableName, "INSERT", "INSTEAD OF", newRowsDf, null, context);
+                    return ExecuteResult.Ok($"{newRowsDf.RowCount} row(s) inserted (handled by INSTEAD OF trigger).", newRowsDf.RowCount);
+                }
 
-                var currentDf = bufferEntry.CurrentSnapshot;
+                var bufferEntry = catalog.BufferPool.GetOrLoad(meta);
+                DataFrame currentDf;
+                using (bufferEntry.AcquireReadLock())
+                {
+                    currentDf = bufferEntry.CurrentSnapshot;
+                }
 
-                // Concatenate in memory
                 var mergedDf = DataFrame.Concat(new[] { currentDf, newRowsDf });
-
-                // Validate constraints
                 await ValidateConstraintsAsync(meta, mergedDf, context);
 
-                // Update in-memory buffer pool and append to WAL
+                BackupForTransaction(meta, catalog, context, bufferEntry);
+
                 using (bufferEntry.AcquireWriteLock())
                 {
-                    bufferEntry.CurrentSnapshot = mergedDf;
-                    bufferEntry.IsDirty = true;
-
                     byte[] payload = TableStorage.SerializeDataFrame(newRowsDf);
-                    Guid txId = context.ActiveTransaction != null ? Guid.Parse(context.ActiveTransaction.TransactionId) : Guid.Empty;
+                    Guid txId = context.ActiveTransaction?.TransactionGuid ?? Guid.Empty;
                     ulong lsn = catalog.WalWriter.AppendRecord(WalRecordType.RowInsert, txId, insertSelect.TableName, payload);
-                    bufferEntry.LastAppliedLsn = lsn;
+                    bufferEntry.ApplyMutation(mergedDf, lsn, txId);
                 }
 
-                // Dispatch AFTER insert triggers
                 await RunTriggersAsync(insertSelect.TableName, "INSERT", "AFTER", newRowsDf, null, context);
 
                 return ExecuteResult.Ok($"{newRowsDf.RowCount} row{(newRowsDf.RowCount == 1 ? "" : "s")} inserted successfully.", newRowsDf.RowCount);
