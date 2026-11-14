@@ -15,4 +15,10 @@
   <ItemGroup>
     <ProjectReference Include="..\Glacier.Sql\Glacier.Sql.csproj" />
   </ItemGroup>
+
+  <ItemGroup>
+    <AssemblyAttribute Include="System.Runtime.CompilerServices.InternalsVisibleToAttribute">
+      <_Parameter1>Glacier.Sql.Tests</_Parameter1>
+    </AssemblyAttribute>
+  </ItemGroup>
 </Project>

@@ -123,20 +123,28 @@ namespace Glacier.Sql.Host.Mcp
         }
 
         public SqlMcpServer(CatalogManager catalog, SqlEngine engine)
+            : this(catalog, engine, Console.OpenStandardInput(), Console.OpenStandardOutput())
+        {
+        }
+
+        public SqlMcpServer(CatalogManager catalog, SqlEngine engine, Stream inputStream, Stream outputStream)
         {
             _catalog = catalog ?? throw new ArgumentNullException(nameof(catalog));
             _engine = engine ?? throw new ArgumentNullException(nameof(engine));
+            ArgumentNullException.ThrowIfNull(inputStream);
+            ArgumentNullException.ThrowIfNull(outputStream);
+
             _context = new Engine.ExecutionContext(_catalog);
             _logPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "mcp_sql_log.txt");
 
             Log("SQL MCP Server instance created.");
 
-            Stream openStandardInput = Console.OpenStandardInput();
-            _reader = new StreamReader(openStandardInput);
-
-            Stream openStandardOutput = Console.OpenStandardOutput();
-            _writer = new StreamWriter(openStandardOutput, new UTF8Encoding(false)) { AutoFlush = true };
-            _writer.NewLine = "\n";
+            _reader = new StreamReader(inputStream, Encoding.UTF8, detectEncodingFromByteOrderMarks: true, bufferSize: 4096, leaveOpen: true);
+            _writer = new StreamWriter(outputStream, new UTF8Encoding(false), bufferSize: 4096, leaveOpen: true)
+            {
+                AutoFlush = true,
+                NewLine = "\n"
+            };
 
             Log("IO setup complete.");
         }

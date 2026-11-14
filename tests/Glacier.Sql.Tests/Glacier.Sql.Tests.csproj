@@ -20,5 +20,6 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\Glacier.Sql\Glacier.Sql.csproj" />
+    <ProjectReference Include="..\..\src\Glacier.Sql.Host\Glacier.Sql.Host.csproj" />
   </ItemGroup>
 </Project>
