@@ -81,7 +81,7 @@ namespace Glacier.Sql.Tests
             // 2: tools/list
             var toolNames = responses[1].RootElement.GetProperty("result").GetProperty("tools")
                 .EnumerateArray()
-                .Select(t => t.GetProperty("name").GetString())
+                .Select(t => t.GetProperty("name").GetString() ?? string.Empty)
                 .ToHashSet();
             Assert.Equal(new[] { "execute_sql", "list_tables", "get_table_schema" }.ToHashSet(), toolNames);
 
