@@ -8,7 +8,8 @@
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
     <NoWarn>$(NoWarn);CS1591</NoWarn>
-    <Version>1.1.0</Version>
+    <Version>1.1.1</Version>
+    <PackageReleaseNotes>v1.1.1: Fixed SQL execution/binding bugs and aligned Glacier.Polaris 1.2.6 dependency.</PackageReleaseNotes>
     <Description>High-performance T-SQL query execution engine built on top of the Glacier.Polaris columnar memory DataFrame engine.</Description>
     <Authors>Glacier Contributors</Authors>
     <PackageTags>sql query-engine polaris dataframe arrow ipc db database transactional locks triggers</PackageTags>
@@ -21,7 +22,8 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="Glacier.Polaris" Version="1.0.20" />
+    <ProjectReference Include="../../../Glacier.Polaris/src/Glacier.Polaris/Glacier.Polaris.csproj" Condition="Exists('../../../Glacier.Polaris/src/Glacier.Polaris/Glacier.Polaris.csproj') and '$(UseLocalProjectReferences)' != 'false'" />
+    <PackageReference Include="Glacier.Polaris" Version="1.2.6" Condition="!Exists('../../../Glacier.Polaris/src/Glacier.Polaris/Glacier.Polaris.csproj') or '$(UseLocalProjectReferences)' == 'false'" />
     <PackageReference Include="System.Security.Cryptography.Pkcs" Version="10.0.14" />
     <None Include="..\..\README.md" Pack="true" PackagePath="\" />
   </ItemGroup>

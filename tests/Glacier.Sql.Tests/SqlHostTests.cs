@@ -95,7 +95,7 @@ namespace Glacier.Sql.Tests
             Assert.Contains("Bob", selectMarkdown);
 
             // 7: Empty set
-            Assert.Equal("No columns returned.", GetToolText(responses[6]));
+            Assert.Equal("Empty Set (0 rows)\n\nColumns: id, name", GetToolText(responses[6]));
 
             // 8: list_tables
             string tablesList = GetToolText(responses[7]);
