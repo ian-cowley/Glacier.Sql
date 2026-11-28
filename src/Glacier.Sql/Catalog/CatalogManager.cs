@@ -404,7 +404,11 @@ namespace Glacier.Sql.Catalog
             {
                 if (tmpPath != null && File.Exists(tmpPath))
                 {
-                    try { File.Delete(tmpPath); } catch { }
+                    try { File.Delete(tmpPath); }
+                    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                    {
+                        GlacierSqlDiagnostics.LogError($"Failed to clean temp file '{tmpPath}': {ex.Message}", ex);
+                    }
                 }
             }
         }

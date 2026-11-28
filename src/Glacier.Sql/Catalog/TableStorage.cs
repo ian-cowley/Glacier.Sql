@@ -51,7 +51,11 @@ namespace Glacier.Sql.Catalog
             {
                 if (File.Exists(tmpPath))
                 {
-                    try { File.Delete(tmpPath); } catch { }
+                    try { File.Delete(tmpPath); }
+                    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                    {
+                        System.Diagnostics.Trace.TraceWarning($"[TableStorage] Failed to clean temp file '{tmpPath}': {ex.Message}");
+                    }
                 }
             }
 
