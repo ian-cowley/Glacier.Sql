@@ -7,6 +7,10 @@ using Glacier.Sql.Catalog;
 using Glacier.Sql.Diagnostics;
 using Xunit;
 
+[CollectionDefinition("GlacierSqlDiagnostics", DisableParallelization = true)]
+public sealed class GlacierSqlDiagnosticsCollection { }
+
+[Collection("GlacierSqlDiagnostics")]
 public class DiagnosticsTests
 {
     [Fact]

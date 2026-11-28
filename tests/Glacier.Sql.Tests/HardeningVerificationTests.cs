@@ -15,6 +15,7 @@ using ExecutionContext = Glacier.Sql.Engine.ExecutionContext;
 
 namespace Glacier.Sql.Tests;
 
+[Collection("GlacierSqlDiagnostics")]
 public class HardeningVerificationTests : IDisposable
 {
     private readonly string _testDir;
@@ -336,7 +337,7 @@ public class HardeningVerificationTests : IDisposable
         var engine = new SqlEngine(catalog);
         var ctx = new ExecutionContext(catalog);
 
-        var logged = new List<(LogLevel Level, string Message, Exception? Ex)>();
+        var logged = new System.Collections.Concurrent.ConcurrentBag<(LogLevel Level, string Message, Exception? Ex)>();
         GlacierSqlDiagnostics.SetLogger(new DelegateGlacierLogger((lvl, msg, ex) => logged.Add((lvl, msg, ex)), LogLevel.Trace));
         try
         {
