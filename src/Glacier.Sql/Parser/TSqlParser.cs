@@ -25,7 +25,10 @@ namespace Glacier.Sql.Parser
                 _position++;
                 return token;
             }
-            throw new Exception(errorMessage ?? $"Expected token of type {type} but found {Current.Type} ('{Current.Text}') at line {Current.Line}, col {Current.Column}");
+            throw new SqlSyntaxException(
+                errorMessage ?? $"Expected token of type {type} but found {Current.Type} ('{Current.Text}') at line {Current.Line}, col {Current.Column}",
+                Current.Line,
+                Current.Column);
         }
 
         private bool Match(TokenType type)
@@ -106,6 +109,22 @@ namespace Glacier.Sql.Parser
 
         public SqlStatement Parse()
         {
+            var stmt = ParseSingleStatement();
+            Match(TokenType.Semicolon);
+
+            if (Current.Type != TokenType.EOF)
+            {
+                throw new SqlSyntaxException(
+                    $"Unexpected trailing token '{Current.Text}' ({Current.Type}) at line {Current.Line}, col {Current.Column}",
+                    Current.Line,
+                    Current.Column);
+            }
+
+            return stmt;
+        }
+
+        internal SqlStatement ParseSingleStatement()
+        {
             if (Current.Type == TokenType.Select)
             {
                 return ParseSelect();
@@ -147,7 +166,10 @@ namespace Glacier.Sql.Parser
                 return ParseRollback();
             }
 
-            throw new Exception($"Unsupported statement starting with '{Current.Text}' at line {Current.Line}, col {Current.Column}");
+            throw new SqlSyntaxException(
+                $"Unsupported statement starting with '{Current.Text}' at line {Current.Line}, col {Current.Column}",
+                Current.Line,
+                Current.Column);
         }
 
         private SqlStatement ParseCreate()
@@ -209,7 +231,7 @@ namespace Glacier.Sql.Parser
             if (Match(TokenType.Bit)) return "BIT";
             if (Match(TokenType.Datetime)) return "DATETIME";
 
-            throw new Exception($"Unsupported data type '{Current.Text}' for column '{columnName}'");
+            throw new SqlSyntaxException($"Unsupported data type '{Current.Text}' for column '{columnName}'", Current.Line, Current.Column);
         }
 
         private void ParseInlineColumnConstraints(ref bool isNullable, ref bool isPrimaryKey, ref bool isUnique, ref string? checkExpression)
@@ -271,19 +293,19 @@ namespace Glacier.Sql.Parser
             }
             else
             {
-                throw new Exception("Expected AFTER or INSTEAD OF in CREATE TRIGGER");
+                throw new SqlSyntaxException("Expected AFTER or INSTEAD OF in CREATE TRIGGER", Current.Line, Current.Column);
             }
 
             string eventType;
             if (Match(TokenType.Insert)) eventType = "INSERT";
             else if (Match(TokenType.Update)) eventType = "UPDATE";
             else if (Match(TokenType.Delete)) eventType = "DELETE";
-            else throw new Exception("Expected INSERT, UPDATE, or DELETE event type in CREATE TRIGGER");
+            else throw new SqlSyntaxException("Expected INSERT, UPDATE, or DELETE event type in CREATE TRIGGER", Current.Line, Current.Column);
 
             Consume(TokenType.As, "Expected AS keyword before trigger body");
 
             int bodyStart = _position;
-            _ = Parse();
+            _ = ParseSingleStatement();
             int bodyEnd = _position;
 
             string actionSql = ReconstructSqlFromTokens(bodyStart, bodyEnd);
@@ -297,6 +319,11 @@ namespace Glacier.Sql.Parser
             {
                 string viewName = Consume(TokenType.Identifier, "Expected view name after DROP VIEW").Text;
                 return new DropViewStatement(viewName);
+            }
+            if (Match(TokenType.Trigger))
+            {
+                string triggerName = Consume(TokenType.Identifier, "Expected trigger name after DROP TRIGGER").Text;
+                return new DropTriggerStatement(triggerName);
             }
             Consume(TokenType.Table);
             string tableName = Consume(TokenType.Identifier, "Expected table name after DROP TABLE").Text;
@@ -334,7 +361,7 @@ namespace Glacier.Sql.Parser
             }
             else
             {
-                throw new Exception("Expected ADD or DROP keyword in ALTER TABLE statement");
+                throw new SqlSyntaxException("Expected ADD or DROP keyword in ALTER TABLE statement", Current.Line, Current.Column);
             }
         }
 

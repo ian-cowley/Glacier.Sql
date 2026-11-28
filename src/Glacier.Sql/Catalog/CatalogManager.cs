@@ -2,9 +2,12 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using Glacier.Polaris;
 using Glacier.Sql.Diagnostics;
+using Glacier.Sql.Parser;
 using Glacier.Sql.Storage.BufferPool;
 using Glacier.Sql.Storage.Wal;
 
@@ -12,6 +15,7 @@ namespace Glacier.Sql.Catalog
 {
     public class TableMetadata
     {
+        public Guid TableId { get; set; } = Guid.NewGuid();
         public string TableName { get; set; } = "";
         public List<ColumnMetadata> Columns { get; set; } = new();
         public string BackingFile { get; set; } = "";
@@ -56,8 +60,10 @@ namespace Glacier.Sql.Catalog
         private readonly object _catalogLock = new();
         private readonly object _walInitLock = new();
         private readonly Dictionary<string, TableMetadata> _tables = new(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<Guid, TableMetadata> _tablesById = new();
         private readonly Dictionary<string, TriggerMetadata> _triggers = new(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, ViewMetadata> _views = new(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, (string DefinitionSql, SelectStatement Ast, List<ColumnMetadata>? Schema)> _viewCache = new(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, AsyncReaderWriterLock> _tableLocks = new(StringComparer.OrdinalIgnoreCase);
         private WalWriter? _walWriter;
 
@@ -87,6 +93,12 @@ namespace Glacier.Sql.Catalog
             BufferPool = bufferPool ?? new TableBufferPool();
 
             Load();
+        }
+
+        private static Guid DeriveLegacyTableId(string tableName)
+        {
+            byte[] hash = SHA256.HashData(Encoding.UTF8.GetBytes((tableName ?? string.Empty).ToUpperInvariant()));
+            return new Guid(hash.AsSpan(0, 16));
         }
 
         public void Load()
@@ -122,11 +134,17 @@ namespace Glacier.Sql.Catalog
                     lock (_catalogLock)
                     {
                         _tables.Clear();
+                        _tablesById.Clear();
                         if (metadataList != null)
                         {
                             foreach (var meta in metadataList)
                             {
+                                if (meta.TableId == Guid.Empty)
+                                {
+                                    meta.TableId = DeriveLegacyTableId(meta.TableName);
+                                }
                                 _tables[meta.TableName] = meta;
+                                _tablesById[meta.TableId] = meta;
                             }
                         }
 
@@ -140,6 +158,7 @@ namespace Glacier.Sql.Catalog
                         }
 
                         _views.Clear();
+                        _viewCache.Clear();
                         if (catalogData?.Views != null)
                         {
                             foreach (var view in catalogData.Views)
@@ -156,107 +175,197 @@ namespace Glacier.Sql.Catalog
             catch (Exception ex)
             {
                 GlacierSqlDiagnostics.LogError($"Error loading catalog: {ex.Message}", ex);
+                if (ex is InvalidDataException)
+                {
+                    throw;
+                }
+                throw new InvalidDataException($"Failed to load catalog at '{_catalogPath}': {ex.Message}", ex);
             }
         }
 
         private void RecoverFromWal()
         {
-            try
+            string walPath = Path.Combine(_dataDir, "glacier.wal");
+            if (!File.Exists(walPath)) return;
+
+            var records = WalReader.Read(walPath, out ulong checkpointLsn, out bool corruptHeader);
+            if (corruptHeader)
             {
-                string walPath = Path.Combine(_dataDir, "glacier.wal");
-                if (!File.Exists(walPath)) return;
+                throw new InvalidDataException($"Corrupt WAL header detected in '{walPath}'.");
+            }
+            if (records.Count == 0) return;
 
-                var records = WalReader.Read(walPath, out ulong checkpointLsn);
-                if (records.Count == 0) return;
+            var committedTx = new HashSet<Guid>();
+            var flushedLsnsById = new Dictionary<Guid, ulong>();
+            var flushedLsnsByName = new Dictionary<string, ulong>(StringComparer.OrdinalIgnoreCase);
 
-                var committedTx = new HashSet<Guid>();
-                var flushedTableLsns = new Dictionary<string, ulong>(StringComparer.OrdinalIgnoreCase);
-
-                foreach (var r in records)
+            foreach (var r in records)
+            {
+                if (r.Type == WalRecordType.TxCommit && r.TxId != Guid.Empty)
                 {
-                    if (r.Type == WalRecordType.TxCommit && r.TxId != Guid.Empty)
-                    {
-                        committedTx.Add(r.TxId);
-                    }
-                    else if (r.Type == WalRecordType.CheckpointEnd && !string.IsNullOrEmpty(r.TableName))
-                    {
-                        ulong tableLsn = r.Payload.Length >= 8
-                            ? BitConverter.ToUInt64(r.Payload.AsSpan(0, 8))
-                            : r.Lsn;
-
-                        if (!flushedTableLsns.TryGetValue(r.TableName, out ulong prev) || tableLsn > prev)
-                        {
-                            flushedTableLsns[r.TableName] = tableLsn;
-                        }
-                    }
+                    committedTx.Add(r.TxId);
                 }
-
-                var uncheckpointed = records.Where(r => r.Lsn > checkpointLsn).ToList();
-                if (uncheckpointed.Count == 0) return;
-
-                int replayedCount = 0;
-                foreach (var r in uncheckpointed)
+                else if (r.Type == WalRecordType.CheckpointEnd && (r.TableId != Guid.Empty || !string.IsNullOrEmpty(r.TableName)))
                 {
-                    if (r.TxId != Guid.Empty && !committedTx.Contains(r.TxId))
-                    {
-                        continue;
-                    }
+                    ulong tableLsn = r.Payload.Length >= 8
+                        ? BitConverter.ToUInt64(r.Payload.AsSpan(0, 8))
+                        : r.Lsn;
 
-                    if (!string.IsNullOrEmpty(r.TableName) &&
-                        flushedTableLsns.TryGetValue(r.TableName, out ulong tableFlushedLsn) &&
-                        r.Lsn <= tableFlushedLsn)
+                    if (r.TableId != Guid.Empty)
                     {
-                        continue;
-                    }
-
-                    if (r.Type == WalRecordType.RowInsert)
-                    {
-                        var meta = GetTable(r.TableName);
-                        if (meta != null)
+                        if (!flushedLsnsById.TryGetValue(r.TableId, out ulong prev) || tableLsn > prev)
                         {
-                            var entry = BufferPool.GetOrLoad(meta);
-                            var insertedDf = TableStorage.DeserializeDataFrame(r.Payload);
-                            if (insertedDf.Columns.Count > 0)
-                            {
-                                using (entry.AcquireWriteLock())
-                                {
-                                    var merged = DataFrame.Concat(new[] { entry.CurrentSnapshot, insertedDf });
-                                    entry.ApplyMutation(merged, r.Lsn, Guid.Empty);
-                                }
-                                replayedCount++;
-                            }
+                            flushedLsnsById[r.TableId] = tableLsn;
                         }
                     }
-                    else if (r.Type == WalRecordType.RowUpdate || r.Type == WalRecordType.RowDelete)
+                    else
                     {
-                        var meta = GetTable(r.TableName);
-                        if (meta != null)
+                        if (!flushedLsnsByName.TryGetValue(r.TableName, out ulong prev) || tableLsn > prev)
                         {
-                            var entry = BufferPool.GetOrLoad(meta);
-                            var snapshotDf = TableStorage.DeserializeDataFrame(r.Payload);
-                            if (snapshotDf.Columns.Count == 0)
-                            {
-                                snapshotDf = TableStorage.CreateEmptyDataFrame(meta.Columns);
-                            }
-
-                            using (entry.AcquireWriteLock())
-                            {
-                                entry.ApplyMutation(snapshotDf, r.Lsn, Guid.Empty);
-                            }
-                            replayedCount++;
+                            flushedLsnsByName[r.TableName] = tableLsn;
                         }
                     }
-                }
-
-                if (replayedCount > 0)
-                {
-                    BufferPool.CheckpointAll(WalWriter);
-                    GlacierSqlDiagnostics.LogInformation($"[WAL Recovery] Successfully replayed {replayedCount} committed mutation records (previous checkpoint LSN {checkpointLsn}).");
                 }
             }
-            catch (Exception ex)
+
+            var uncheckpointed = records.Where(r => r.Lsn > checkpointLsn).ToList();
+            if (uncheckpointed.Count == 0) return;
+
+            int replayedCount = 0;
+            foreach (var r in uncheckpointed)
             {
-                GlacierSqlDiagnostics.LogError($"[WAL Recovery] Error during recovery: {ex.Message}", ex);
+                if (r.TxId != Guid.Empty && !committedTx.Contains(r.TxId))
+                {
+                    continue;
+                }
+
+                if (r.TableId != Guid.Empty)
+                {
+                    if (flushedLsnsById.TryGetValue(r.TableId, out ulong idFlushedLsn) && r.Lsn <= idFlushedLsn)
+                    {
+                        continue;
+                    }
+                }
+                else if (!string.IsNullOrEmpty(r.TableName) &&
+                         flushedLsnsByName.TryGetValue(r.TableName, out ulong nameFlushedLsn) &&
+                         r.Lsn <= nameFlushedLsn)
+                {
+                    continue;
+                }
+
+                TableMetadata? meta = r.TableId != Guid.Empty ? GetTableById(r.TableId) : GetTable(r.TableName);
+                if (meta == null)
+                {
+                    continue;
+                }
+
+                if (r.Type == WalRecordType.RowInsert)
+                {
+                    var entry = BufferPool.GetOrLoad(meta);
+                    var insertedDf = TableStorage.DeserializeDataFrame(r.Payload);
+                    if (insertedDf.Columns.Count > 0)
+                    {
+                        using (entry.AcquireWriteLock())
+                        {
+                            if (entry.CurrentSnapshot.Columns.Count == 0)
+                            {
+                                entry.ApplyMutation(insertedDf, r.Lsn, Guid.Empty);
+                            }
+                            else
+                            {
+                                entry.ApplyAppend(insertedDf, r.Lsn, Guid.Empty);
+                            }
+                        }
+                        replayedCount++;
+                    }
+                }
+                else if (r.Type == WalRecordType.RowUpdate || r.Type == WalRecordType.RowDelete)
+                {
+                    var entry = BufferPool.GetOrLoad(meta);
+                    var snapshotDf = TableStorage.DeserializeDataFrame(r.Payload);
+                    if (snapshotDf.Columns.Count == 0)
+                    {
+                        snapshotDf = TableStorage.CreateEmptyDataFrame(meta.Columns);
+                    }
+
+                    using (entry.AcquireWriteLock())
+                    {
+                        entry.ApplyMutation(snapshotDf, r.Lsn, Guid.Empty);
+                    }
+                    replayedCount++;
+                }
+                else if (r.Type == WalRecordType.RowDeleteDelta)
+                {
+                    var entry = BufferPool.GetOrLoad(meta);
+                    using (entry.AcquireWriteLock())
+                    {
+                        if (r.Payload.Length >= 4)
+                        {
+                            int count = BitConverter.ToInt32(r.Payload.AsSpan(0, 4));
+                            if (count < 0)
+                            {
+                                entry.ApplyMutation(TableStorage.CreateEmptyDataFrame(meta.Columns), r.Lsn, Guid.Empty);
+                            }
+                            else
+                            {
+                                var deletedSet = new HashSet<int>(count);
+                                int offset = 4;
+                                for (int i = 0; i < count && offset + 4 <= r.Payload.Length; i++, offset += 4)
+                                {
+                                    deletedSet.Add(BitConverter.ToInt32(r.Payload.AsSpan(offset, 4)));
+                                }
+
+                                var current = entry.CurrentSnapshot;
+                                var keepIndices = new List<int>(Math.Max(0, current.RowCount - deletedSet.Count));
+                                for (int rowIdx = 0; rowIdx < current.RowCount; rowIdx++)
+                                {
+                                    if (!deletedSet.Contains(rowIdx))
+                                    {
+                                        keepIndices.Add(rowIdx);
+                                    }
+                                }
+                                var keptDf = TableStorage.TakeRows(current, System.Runtime.InteropServices.CollectionsMarshal.AsSpan(keepIndices));
+                                entry.ApplyMutation(keptDf, r.Lsn, Guid.Empty);
+                            }
+                        }
+                    }
+                    replayedCount++;
+                }
+                else if (r.Type == WalRecordType.RowUpdateDelta)
+                {
+                    var entry = BufferPool.GetOrLoad(meta);
+                    using (entry.AcquireWriteLock())
+                    {
+                        if (r.Payload.Length >= 4)
+                        {
+                            int count = BitConverter.ToInt32(r.Payload.AsSpan(0, 4));
+                            int indicesBytes = count * 4;
+                            if (count >= 0 && 4 + indicesBytes <= r.Payload.Length)
+                            {
+                                var updatedIndices = new int[count];
+                                int offset = 4;
+                                for (int i = 0; i < count; i++, offset += 4)
+                                {
+                                    updatedIndices[i] = BitConverter.ToInt32(r.Payload.AsSpan(offset, 4));
+                                }
+
+                                var updatedRowsDf = TableStorage.DeserializeDataFrame(r.Payload.AsSpan(offset));
+                                if (updatedRowsDf.Columns.Count > 0)
+                                {
+                                    var patchedDf = TableStorage.ApplyUpdatedRows(entry.CurrentSnapshot, updatedIndices, updatedRowsDf);
+                                    entry.ApplyMutation(patchedDf, r.Lsn, Guid.Empty);
+                                }
+                            }
+                        }
+                    }
+                    replayedCount++;
+                }
+            }
+
+            if (replayedCount > 0)
+            {
+                BufferPool.CheckpointAll(WalWriter);
+                GlacierSqlDiagnostics.LogInformation($"[WAL Recovery] Successfully replayed {replayedCount} committed mutation records (previous checkpoint LSN {checkpointLsn}).");
             }
         }
 
@@ -289,6 +398,7 @@ namespace Glacier.Sql.Catalog
             catch (Exception ex)
             {
                 GlacierSqlDiagnostics.LogError($"Error saving catalog: {ex.Message}", ex);
+                throw;
             }
             finally
             {
@@ -303,6 +413,7 @@ namespace Glacier.Sql.Catalog
         {
             return new TableMetadata
             {
+                TableId = src.TableId,
                 TableName = src.TableName,
                 BackingFile = src.BackingFile,
                 Columns = new List<ColumnMetadata>(src.Columns)
@@ -325,6 +436,15 @@ namespace Glacier.Sql.Catalog
             }
         }
 
+        public TableMetadata? GetTableById(Guid tableId)
+        {
+            if (tableId == Guid.Empty) return null;
+            lock (_catalogLock)
+            {
+                return _tablesById.TryGetValue(tableId, out var meta) ? meta : null;
+            }
+        }
+
         public IEnumerable<TableMetadata> ListTables()
         {
             lock (_catalogLock)
@@ -337,6 +457,7 @@ namespace Glacier.Sql.Catalog
         {
             var meta = new TableMetadata
             {
+                TableId = Guid.NewGuid(),
                 TableName = tableName,
                 Columns = columns,
                 BackingFile = Path.Combine(_dataDir, $"{tableName}.ipc")
@@ -347,10 +468,34 @@ namespace Glacier.Sql.Catalog
             lock (_catalogLock)
             {
                 _tables[tableName] = meta;
+                _tablesById[meta.TableId] = meta;
+                InvalidateViewSchemasLocked();
             }
 
             BufferPool.Invalidate(tableName);
             Save();
+        }
+
+        internal TableMetadata AddTableInMemory(string tableName, List<ColumnMetadata> columns)
+        {
+            var meta = new TableMetadata
+            {
+                TableId = Guid.NewGuid(),
+                TableName = tableName,
+                Columns = columns,
+                BackingFile = Path.Combine(_dataDir, $"{tableName}.ipc")
+            };
+
+            lock (_catalogLock)
+            {
+                _tables[tableName] = meta;
+                _tablesById[meta.TableId] = meta;
+                InvalidateViewSchemasLocked();
+            }
+
+            BufferPool.Invalidate(tableName);
+            BufferPool.GetOrLoad(meta);
+            return meta;
         }
 
         public void RemoveTable(string tableName)
@@ -364,6 +509,8 @@ namespace Glacier.Sql.Catalog
                 }
 
                 _tables.Remove(tableName);
+                _tablesById.Remove(meta.TableId);
+                InvalidateViewSchemasLocked();
 
                 var triggersToRemove = _triggers.Values
                     .Where(t => t.TableName.Equals(tableName, StringComparison.OrdinalIgnoreCase))
@@ -379,13 +526,103 @@ namespace Glacier.Sql.Catalog
             BufferPool.Invalidate(tableName);
             Save();
 
-            if (File.Exists(meta.BackingFile))
+            if (!string.IsNullOrEmpty(meta.BackingFile) && File.Exists(meta.BackingFile))
             {
                 try
                 {
                     File.Delete(meta.BackingFile);
                 }
-                catch { /* Ignore delete errors */ }
+                catch (Exception ex) when (ex is not FileNotFoundException)
+                {
+                    GlacierSqlDiagnostics.LogWarning($"Failed to delete backing file '{meta.BackingFile}': {ex.Message}", ex);
+                }
+            }
+
+            PruneTableLock(tableName);
+        }
+
+        internal void RemoveTableInMemory(
+            string tableName,
+            out TableMetadata? removedMeta,
+            out List<TriggerMetadata> removedTriggers,
+            out TableBufferEntry? detachedEntry)
+        {
+            removedTriggers = new List<TriggerMetadata>();
+            detachedEntry = null;
+
+            lock (_catalogLock)
+            {
+                if (!_tables.TryGetValue(tableName, out removedMeta))
+                {
+                    return;
+                }
+
+                _tables.Remove(tableName);
+                _tablesById.Remove(removedMeta.TableId);
+                InvalidateViewSchemasLocked();
+
+                var trigNames = _triggers.Values
+                    .Where(t => t.TableName.Equals(tableName, StringComparison.OrdinalIgnoreCase))
+                    .Select(t => t.TriggerName)
+                    .ToList();
+
+                foreach (var name in trigNames)
+                {
+                    if (_triggers.TryGetValue(name, out var trig))
+                    {
+                        removedTriggers.Add(trig);
+                        _triggers.Remove(name);
+                    }
+                }
+            }
+
+            BufferPool.DetachEntry(tableName, out detachedEntry);
+        }
+
+        internal void RestoreTableInMemory(TableMetadata meta, List<TriggerMetadata> triggers, TableBufferEntry? entry)
+        {
+            lock (_catalogLock)
+            {
+                _tables[meta.TableName] = meta;
+                _tablesById[meta.TableId] = meta;
+                foreach (var trig in triggers)
+                {
+                    _triggers[trig.TriggerName] = trig;
+                }
+                InvalidateViewSchemasLocked();
+            }
+
+            if (entry != null)
+            {
+                BufferPool.AttachEntry(entry);
+            }
+        }
+
+        internal void FinalizeTableDrop(TableMetadata meta, TableBufferEntry? detachedEntry)
+        {
+            detachedEntry?.Dispose();
+            Save();
+
+            if (!string.IsNullOrEmpty(meta.BackingFile) && File.Exists(meta.BackingFile))
+            {
+                try
+                {
+                    File.Delete(meta.BackingFile);
+                }
+                catch (Exception ex) when (ex is not FileNotFoundException)
+                {
+                    GlacierSqlDiagnostics.LogWarning($"Failed to delete backing file '{meta.BackingFile}': {ex.Message}", ex);
+                }
+            }
+
+            PruneTableLock(meta.TableName);
+        }
+
+        internal void PruneTableLock(string tableName)
+        {
+            lock (_tableLocks)
+            {
+                _tableLocks.Remove(tableName);
             }
         }
 
@@ -399,6 +636,14 @@ namespace Glacier.Sql.Catalog
             Save();
         }
 
+        internal void AddTriggerInMemory(TriggerMetadata trig)
+        {
+            lock (_catalogLock)
+            {
+                _triggers[trig.TriggerName] = trig;
+            }
+        }
+
         public void RemoveTrigger(string triggerName)
         {
             bool removed;
@@ -409,6 +654,27 @@ namespace Glacier.Sql.Catalog
             if (removed)
             {
                 Save();
+            }
+        }
+
+        internal TriggerMetadata? RemoveTriggerInMemory(string triggerName)
+        {
+            lock (_catalogLock)
+            {
+                if (_triggers.TryGetValue(triggerName, out var trig))
+                {
+                    _triggers.Remove(triggerName);
+                    return trig;
+                }
+                return null;
+            }
+        }
+
+        public TriggerMetadata? GetTrigger(string triggerName)
+        {
+            lock (_catalogLock)
+            {
+                return _triggers.TryGetValue(triggerName, out var trig) ? trig : null;
             }
         }
 
@@ -440,6 +706,12 @@ namespace Glacier.Sql.Catalog
         // View Operations
         public void AddView(string viewName, string definitionSql)
         {
+            AddViewInMemory(viewName, definitionSql);
+            Save();
+        }
+
+        internal void AddViewInMemory(string viewName, string definitionSql)
+        {
             var meta = new ViewMetadata
             {
                 ViewName = viewName,
@@ -448,20 +720,84 @@ namespace Glacier.Sql.Catalog
             lock (_catalogLock)
             {
                 _views[viewName] = meta;
+                _viewCache.Remove(viewName);
+                InvalidateViewSchemasLocked();
             }
-            Save();
         }
 
         public void RemoveView(string viewName)
         {
-            bool removed;
-            lock (_catalogLock)
-            {
-                removed = _views.Remove(viewName);
-            }
-            if (removed)
+            if (RemoveViewInMemory(viewName) != null)
             {
                 Save();
+            }
+        }
+
+        internal ViewMetadata? RemoveViewInMemory(string viewName)
+        {
+            lock (_catalogLock)
+            {
+                if (_views.TryGetValue(viewName, out var meta))
+                {
+                    _views.Remove(viewName);
+                    _viewCache.Remove(viewName);
+                    InvalidateViewSchemasLocked();
+                    return meta;
+                }
+                return null;
+            }
+        }
+
+        internal void RestoreViewInMemory(ViewMetadata viewMeta)
+        {
+            lock (_catalogLock)
+            {
+                _views[viewMeta.ViewName] = viewMeta;
+                _viewCache.Remove(viewMeta.ViewName);
+                InvalidateViewSchemasLocked();
+            }
+        }
+
+        internal void InvalidateAllViewSchemas()
+        {
+            lock (_catalogLock)
+            {
+                InvalidateViewSchemasLocked();
+            }
+        }
+
+        private void InvalidateViewSchemasLocked()
+        {
+            if (_viewCache.Count == 0) return;
+            foreach (var key in _viewCache.Keys.ToList())
+            {
+                var entry = _viewCache[key];
+                _viewCache[key] = (entry.DefinitionSql, entry.Ast, null);
+            }
+        }
+
+        internal bool TryGetCachedView(string viewName, string expectedSql, out SelectStatement? ast, out List<ColumnMetadata>? schema)
+        {
+            lock (_catalogLock)
+            {
+                if (_viewCache.TryGetValue(viewName, out var cached) &&
+                    string.Equals(cached.DefinitionSql, expectedSql, StringComparison.Ordinal))
+                {
+                    ast = cached.Ast;
+                    schema = cached.Schema;
+                    return true;
+                }
+            }
+            ast = null;
+            schema = null;
+            return false;
+        }
+
+        internal void CacheView(string viewName, string definitionSql, SelectStatement ast, List<ColumnMetadata>? schema)
+        {
+            lock (_catalogLock)
+            {
+                _viewCache[viewName] = (definitionSql, ast, schema);
             }
         }
 

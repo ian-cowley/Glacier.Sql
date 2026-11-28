@@ -74,16 +74,21 @@ namespace Glacier.Sql.Tests
             var responses = ParseLines(Encoding.UTF8.GetString(output.ToArray()));
             Assert.Equal(10, responses.Count);
 
-            // 1: initialize
+            // 1: initialize (reports assembly version 1.1.1, not hardcoded 1.1.0)
             Assert.Equal("2024-11-05", responses[0].RootElement.GetProperty("result").GetProperty("protocolVersion").GetString());
             Assert.Equal("Glacier.Sql", responses[0].RootElement.GetProperty("result").GetProperty("serverInfo").GetProperty("name").GetString());
+            Assert.NotEqual("1.1.0", responses[0].RootElement.GetProperty("result").GetProperty("serverInfo").GetProperty("version").GetString());
 
-            // 2: tools/list
-            var toolNames = responses[1].RootElement.GetProperty("result").GetProperty("tools")
-                .EnumerateArray()
+            // 2: tools/list (includes maxResults and offset pagination parameters on execute_sql)
+            var toolsArray = responses[1].RootElement.GetProperty("result").GetProperty("tools").EnumerateArray().ToList();
+            var toolNames = toolsArray
                 .Select(t => t.GetProperty("name").GetString() ?? string.Empty)
                 .ToHashSet();
             Assert.Equal(new[] { "execute_sql", "list_tables", "get_table_schema" }.ToHashSet(), toolNames);
+            var execProps = toolsArray.First(t => t.GetProperty("name").GetString() == "execute_sql")
+                .GetProperty("inputSchema").GetProperty("properties");
+            Assert.True(execProps.TryGetProperty("maxResults", out _));
+            Assert.True(execProps.TryGetProperty("offset", out _));
 
             // 3..6: CREATE, INSERT x2, SELECT
             Assert.DoesNotContain("ERROR:", GetToolText(responses[2]));
@@ -108,8 +113,72 @@ namespace Glacier.Sql.Tests
             Assert.Contains("| id |", schema);
             Assert.Contains("| name |", schema);
 
-            // 10: get_table_schema (not found)
+            // 10: get_table_schema (not found) sets isError=true
             Assert.Contains("ERROR: Table 'missing_table' not found", GetToolText(responses[9]));
+            Assert.True(responses[9].RootElement.GetProperty("result").GetProperty("isError").GetBoolean());
+        }
+
+        [Fact]
+        public async Task Host_Pagination_IsError_DataDirAndLogGating_WorkCleanly()
+        {
+            string? prevDataDirEnv = Environment.GetEnvironmentVariable("GLACIER_SQL_DATA_DIR");
+            string? prevLogEnv = Environment.GetEnvironmentVariable("GLACIER_SQL_MCP_LOG");
+            try
+            {
+                Environment.SetEnvironmentVariable("GLACIER_SQL_DATA_DIR", _tempDir);
+                Environment.SetEnvironmentVariable("GLACIER_SQL_MCP_LOG", null);
+
+                // Verify ResolveDataDirectory precedence
+                Assert.Equal("explicit", Glacier.Sql.Host.Program.ResolveDataDirectory(new[] { "--data-dir", "cli" }, "explicit"));
+                Assert.Equal("cli", Glacier.Sql.Host.Program.ResolveDataDirectory(new[] { "--data-dir", "cli" }));
+                Assert.Equal("cli_eq", Glacier.Sql.Host.Program.ResolveDataDirectory(new[] { "--data-dir=cli_eq" }));
+                Assert.Equal(_tempDir, Glacier.Sql.Host.Program.ResolveDataDirectory(Array.Empty<string>()));
+
+                Environment.SetEnvironmentVariable("GLACIER_SQL_DATA_DIR", null);
+                string fallback = Glacier.Sql.Host.Program.ResolveDataDirectory(Array.Empty<string>());
+                Assert.False(fallback.StartsWith(AppDomain.CurrentDomain.BaseDirectory, StringComparison.OrdinalIgnoreCase));
+
+                // Verify mcp_sql_log.txt is disabled when GLACIER_SQL_MCP_LOG is unset
+                Assert.Null(SqlMcpServer.ResolveLogPath(_tempDir));
+
+                // Verify pagination (maxResults + offset) and isError=true on invalid SQL
+                var reqs = new List<string>
+                {
+                    """{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"execute_sql","arguments":{"sql":"CREATE TABLE paged (id INT)"}}}""",
+                    """{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"execute_sql","arguments":{"sql":"INSERT INTO paged VALUES (1),(2),(3),(4),(5)"}}}""",
+                    """{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"execute_sql","arguments":{"sql":"SELECT id FROM paged ORDER BY id ASC","maxResults":2,"offset":1}}}""",
+                    """{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"execute_sql","arguments":{"sql":"SELECT * FROM missing_tbl_err"}}}"""
+                };
+                string payload = string.Join("\n", reqs) + "\n";
+
+                using var input = new MemoryStream(Encoding.UTF8.GetBytes(payload));
+                using var output = new MemoryStream();
+                await Glacier.Sql.Host.Program.RunAsync(Array.Empty<string>(), _tempDir, input, output);
+
+                var responses = ParseLines(Encoding.UTF8.GetString(output.ToArray()));
+                Assert.Equal(4, responses.Count);
+
+                string pagedMd = GetToolText(responses[2]);
+                Assert.DoesNotContain("| 1 |", pagedMd);
+                Assert.Contains("| 2 |", pagedMd);
+                Assert.Contains("| 3 |", pagedMd);
+                Assert.DoesNotContain("| 4 |", pagedMd);
+                Assert.Contains("Showing rows 2-3 of 5", pagedMd);
+
+                Assert.True(responses[3].RootElement.GetProperty("result").GetProperty("isError").GetBoolean());
+                Assert.False(File.Exists(Path.Combine(_tempDir, "mcp_sql_log.txt")));
+                Assert.False(File.Exists(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "mcp_sql_log.txt")));
+
+                // When GLACIER_SQL_MCP_LOG=1, log is written inside _tempDir (not BaseDirectory)
+                Environment.SetEnvironmentVariable("GLACIER_SQL_MCP_LOG", "1");
+                string? enabledPath = SqlMcpServer.ResolveLogPath(_tempDir);
+                Assert.Equal(Path.Combine(_tempDir, "mcp_sql_log.txt"), enabledPath);
+            }
+            finally
+            {
+                Environment.SetEnvironmentVariable("GLACIER_SQL_DATA_DIR", prevDataDirEnv);
+                Environment.SetEnvironmentVariable("GLACIER_SQL_MCP_LOG", prevLogEnv);
+            }
         }
 
         [Fact]

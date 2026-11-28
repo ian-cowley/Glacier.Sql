@@ -1,27 +1,28 @@
 using System;
+using System.Buffers;
 using System.Collections.Generic;
-using System.Text;
+using System.Runtime.CompilerServices;
 
 namespace Glacier.Sql.Parser
 {
     public enum TokenType
     {
         // Keywords
-        Select, From, Join, Inner, Left, Cross, On, Where, Group, By, Having, Order, Asc, Desc, Top, As, And, Or, Not, Is, Null, Create, Table, Drop, Insert, Into, Values, Update, Set, Delete, Begin, Transaction, Commit, Rollback,
+        Select, From, Join, Inner, Left, Right, Full, Outer, Cross, On, Where, Group, By, Having, Order, Asc, Desc, Top, As, And, Or, Not, Is, Null, Create, Table, Drop, Insert, Into, Values, Update, Set, Delete, Begin, Transaction, Commit, Rollback,
         Trigger, After, Instead, Of,
         Alter, Add, Column, View, Unique, Check, Primary, Key, In, Exists, Constraint,
-        
+
         // Data Types
         Int, Float, Varchar, Bit, Datetime,
-        
+
         // Identifiers & Literals
         Identifier, StringLiteral, NumberLiteral, BooleanLiteral,
-        
+
         // Symbols & Operators
         Equal, NotEqual, GreaterThan, LessThan, GreaterOrEqual, LessOrEqual,
         Plus, Minus, Multiply, Divide,
-        OpenParenthesis, CloseParenthesis, Comma, Dot, Star,
-        
+        OpenParenthesis, CloseParenthesis, Comma, Dot, Star, Semicolon,
+
         // Special
         EOF, Invalid
     }
@@ -30,92 +31,187 @@ namespace Glacier.Sql.Parser
 
     public class SqlLexer
     {
+        private sealed class KeywordTrieNode
+        {
+            public readonly KeywordTrieNode?[] Children = new KeywordTrieNode?[128];
+            public bool IsTerminal;
+            public TokenType TokenType;
+            public string? CanonicalText;
+        }
+
+        private static readonly KeywordTrieNode KeywordTrieRoot = BuildKeywordTrie();
+
+        private static KeywordTrieNode BuildKeywordTrie()
+        {
+            var root = new KeywordTrieNode();
+
+            void Insert(string keyword, TokenType tokenType)
+            {
+                KeywordTrieNode current = root;
+                for (int i = 0; i < keyword.Length; i++)
+                {
+                    byte b = ToUpperAscii((byte)keyword[i]);
+                    var next = current.Children[b];
+                    if (next == null)
+                    {
+                        next = new KeywordTrieNode();
+                        current.Children[b] = next;
+                    }
+                    current = next;
+                }
+                current.IsTerminal = true;
+                current.TokenType = tokenType;
+                current.CanonicalText = keyword;
+            }
+
+            Insert("SELECT", TokenType.Select);
+            Insert("FROM", TokenType.From);
+            Insert("JOIN", TokenType.Join);
+            Insert("INNER", TokenType.Inner);
+            Insert("LEFT", TokenType.Left);
+            Insert("RIGHT", TokenType.Right);
+            Insert("FULL", TokenType.Full);
+            Insert("OUTER", TokenType.Outer);
+            Insert("CROSS", TokenType.Cross);
+            Insert("ON", TokenType.On);
+            Insert("WHERE", TokenType.Where);
+            Insert("GROUP", TokenType.Group);
+            Insert("BY", TokenType.By);
+            Insert("HAVING", TokenType.Having);
+            Insert("ORDER", TokenType.Order);
+            Insert("ASC", TokenType.Asc);
+            Insert("DESC", TokenType.Desc);
+            Insert("TOP", TokenType.Top);
+            Insert("AS", TokenType.As);
+            Insert("AND", TokenType.And);
+            Insert("OR", TokenType.Or);
+            Insert("NOT", TokenType.Not);
+            Insert("IS", TokenType.Is);
+            Insert("NULL", TokenType.Null);
+            Insert("CREATE", TokenType.Create);
+            Insert("TABLE", TokenType.Table);
+            Insert("DROP", TokenType.Drop);
+            Insert("INSERT", TokenType.Insert);
+            Insert("INTO", TokenType.Into);
+            Insert("VALUES", TokenType.Values);
+            Insert("UPDATE", TokenType.Update);
+            Insert("SET", TokenType.Set);
+            Insert("DELETE", TokenType.Delete);
+            Insert("BEGIN", TokenType.Begin);
+            Insert("TRANSACTION", TokenType.Transaction);
+            Insert("TRAN", TokenType.Transaction);
+            Insert("COMMIT", TokenType.Commit);
+            Insert("ROLLBACK", TokenType.Rollback);
+            Insert("TRIGGER", TokenType.Trigger);
+            Insert("AFTER", TokenType.After);
+            Insert("INSTEAD", TokenType.Instead);
+            Insert("OF", TokenType.Of);
+            Insert("ALTER", TokenType.Alter);
+            Insert("ADD", TokenType.Add);
+            Insert("COLUMN", TokenType.Column);
+            Insert("VIEW", TokenType.View);
+            Insert("UNIQUE", TokenType.Unique);
+            Insert("CHECK", TokenType.Check);
+            Insert("PRIMARY", TokenType.Primary);
+            Insert("KEY", TokenType.Key);
+            Insert("IN", TokenType.In);
+            Insert("EXISTS", TokenType.Exists);
+            Insert("CONSTRAINT", TokenType.Constraint);
+
+            // Types
+            Insert("INT", TokenType.Int);
+            Insert("INTEGER", TokenType.Int);
+            Insert("FLOAT", TokenType.Float);
+            Insert("REAL", TokenType.Float);
+            Insert("DOUBLE", TokenType.Float);
+            Insert("VARCHAR", TokenType.Varchar);
+            Insert("NVARCHAR", TokenType.Varchar);
+            Insert("TEXT", TokenType.Varchar);
+            Insert("BIT", TokenType.Bit);
+            Insert("BOOLEAN", TokenType.Bit);
+            Insert("DATETIME", TokenType.Datetime);
+            Insert("DATE", TokenType.Datetime);
+
+            // Boolean values
+            Insert("TRUE", TokenType.BooleanLiteral);
+            Insert("FALSE", TokenType.BooleanLiteral);
+
+            return root;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static byte ToUpperAscii(byte b)
+        {
+            if (b >= 97 && b <= 122)
+            {
+                return (byte)(b - 32);
+            }
+            return b;
+        }
+
+        private static bool TryMatchKeyword(ReadOnlySpan<char> span, out TokenType tokenType, out string canonicalText)
+        {
+            KeywordTrieNode current = KeywordTrieRoot;
+            for (int i = 0; i < span.Length; i++)
+            {
+                char ch = span[i];
+                if (ch >= 128)
+                {
+                    tokenType = default;
+                    canonicalText = string.Empty;
+                    return false;
+                }
+
+                byte upper = ToUpperAscii((byte)ch);
+                var next = current.Children[upper];
+                if (next == null)
+                {
+                    tokenType = default;
+                    canonicalText = string.Empty;
+                    return false;
+                }
+                current = next;
+            }
+
+            if (current.IsTerminal)
+            {
+                tokenType = current.TokenType;
+                canonicalText = current.CanonicalText!;
+                return true;
+            }
+
+            tokenType = default;
+            canonicalText = string.Empty;
+            return false;
+        }
+
+        public static bool IsKeyword(string text)
+        {
+            if (string.IsNullOrEmpty(text)) return false;
+            return TryMatchKeyword(text.AsSpan(), out _, out _);
+        }
+
         private readonly string _input;
         private int _position;
         private int _line = 1;
         private int _column = 1;
-
-        private static readonly Dictionary<string, TokenType> Keywords = new(StringComparer.OrdinalIgnoreCase)
-        {
-            { "SELECT", TokenType.Select },
-            { "FROM", TokenType.From },
-            { "JOIN", TokenType.Join },
-            { "INNER", TokenType.Inner },
-            { "LEFT", TokenType.Left },
-            { "CROSS", TokenType.Cross },
-            { "ON", TokenType.On },
-            { "WHERE", TokenType.Where },
-            { "GROUP", TokenType.Group },
-            { "BY", TokenType.By },
-            { "HAVING", TokenType.Having },
-            { "ORDER", TokenType.Order },
-            { "ASC", TokenType.Asc },
-            { "DESC", TokenType.Desc },
-            { "TOP", TokenType.Top },
-            { "AS", TokenType.As },
-            { "AND", TokenType.And },
-            { "OR", TokenType.Or },
-            { "NOT", TokenType.Not },
-            { "IS", TokenType.Is },
-            { "NULL", TokenType.Null },
-            { "CREATE", TokenType.Create },
-            { "TABLE", TokenType.Table },
-            { "DROP", TokenType.Drop },
-            { "INSERT", TokenType.Insert },
-            { "INTO", TokenType.Into },
-            { "VALUES", TokenType.Values },
-            { "UPDATE", TokenType.Update },
-            { "SET", TokenType.Set },
-            { "DELETE", TokenType.Delete },
-            { "BEGIN", TokenType.Begin },
-            { "TRANSACTION", TokenType.Transaction },
-            { "TRAN", TokenType.Transaction },
-            { "COMMIT", TokenType.Commit },
-            { "ROLLBACK", TokenType.Rollback },
-            { "TRIGGER", TokenType.Trigger },
-            { "AFTER", TokenType.After },
-            { "INSTEAD", TokenType.Instead },
-            { "OF", TokenType.Of },
-            { "ALTER", TokenType.Alter },
-            { "ADD", TokenType.Add },
-            { "COLUMN", TokenType.Column },
-            { "VIEW", TokenType.View },
-            { "UNIQUE", TokenType.Unique },
-            { "CHECK", TokenType.Check },
-            { "PRIMARY", TokenType.Primary },
-            { "KEY", TokenType.Key },
-            { "IN", TokenType.In },
-            { "EXISTS", TokenType.Exists },
-            { "CONSTRAINT", TokenType.Constraint },
-            
-            // Types
-            { "INT", TokenType.Int },
-            { "INTEGER", TokenType.Int },
-            { "FLOAT", TokenType.Float },
-            { "REAL", TokenType.Float },
-            { "DOUBLE", TokenType.Float },
-            { "VARCHAR", TokenType.Varchar },
-            { "NVARCHAR", TokenType.Varchar },
-            { "TEXT", TokenType.Varchar },
-            { "BIT", TokenType.Bit },
-            { "BOOLEAN", TokenType.Bit },
-            { "DATETIME", TokenType.Datetime },
-            { "DATE", TokenType.Datetime },
-            
-            // Boolean values
-            { "TRUE", TokenType.BooleanLiteral },
-            { "FALSE", TokenType.BooleanLiteral }
-        };
-
-        public static bool IsKeyword(string text) => Keywords.ContainsKey(text);
 
         public SqlLexer(string input)
         {
             _input = input ?? "";
         }
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private char Peek() => _position >= _input.Length ? '\0' : _input[_position];
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private char PeekAhead(int offset)
+        {
+            int index = _position + offset;
+            return (uint)index >= (uint)_input.Length ? '\0' : _input[index];
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private char ReadChar()
         {
             if (_position >= _input.Length) return '\0';
@@ -134,7 +230,8 @@ namespace Glacier.Sql.Parser
 
         public List<Token> Tokenize()
         {
-            var tokens = new List<Token>();
+            int estimatedCapacity = Math.Max(8, _input.Length / 5);
+            var tokens = new List<Token>(estimatedCapacity);
             while (true)
             {
                 var token = NextToken();
@@ -156,81 +253,123 @@ namespace Glacier.Sql.Parser
                 return new Token(TokenType.EOF, "", startLine, startColumn);
             }
 
-            char c = Peek();
+            ReadOnlySpan<char> inputSpan = _input.AsSpan();
+            char c = inputSpan[_position];
 
             // Identifiers with brackets [Column Name]
             if (c == '[')
             {
                 ReadChar(); // consume '['
-                var sb = new StringBuilder();
-                while (Peek() != ']' && Peek() != '\0')
+                int contentStart = _position;
+                while (_position < inputSpan.Length && inputSpan[_position] != ']')
                 {
-                    sb.Append(ReadChar());
+                    ReadChar();
                 }
+                int contentLength = _position - contentStart;
+                string ident = contentLength == 0 ? string.Empty : _input.Substring(contentStart, contentLength);
                 if (Peek() == ']')
                 {
                     ReadChar(); // consume ']'
                 }
-                return new Token(TokenType.Identifier, sb.ToString(), startLine, startColumn);
+                return new Token(TokenType.Identifier, ident, startLine, startColumn);
             }
 
             // String literals 'String Value'
             if (c == '\'')
             {
                 ReadChar(); // consume opening quote
-                var sb = new StringBuilder();
-                while (true)
+                int contentStart = _position;
+                bool hasEscape = false;
+
+                while (_position < inputSpan.Length)
                 {
-                    char next = Peek();
-                    if (next == '\0') break; // unterminated string
+                    char next = inputSpan[_position];
                     if (next == '\'')
                     {
                         ReadChar(); // consume quote
                         if (Peek() == '\'')
                         {
-                            // Escaped quote: '' -> '
-                            sb.Append(ReadChar());
+                            hasEscape = true;
+                            ReadChar(); // consume escaped quote
                         }
                         else
                         {
-                            break; // end of string
+                            // End of string (excluding the closing quote we just consumed)
+                            int rawLength = (_position - 1) - contentStart;
+                            if (!hasEscape)
+                            {
+                                string lit = rawLength == 0 ? string.Empty : _input.Substring(contentStart, rawLength);
+                                return new Token(TokenType.StringLiteral, lit, startLine, startColumn);
+                            }
+
+                            string unescaped = UnescapeQuotedString(inputSpan.Slice(contentStart, rawLength));
+                            return new Token(TokenType.StringLiteral, unescaped, startLine, startColumn);
                         }
                     }
                     else
                     {
-                        sb.Append(ReadChar());
+                        ReadChar();
                     }
                 }
-                return new Token(TokenType.StringLiteral, sb.ToString(), startLine, startColumn);
+
+                // Unterminated string literal
+                int unterminatedLen = _position - contentStart;
+                string unterminated = !hasEscape
+                    ? (unterminatedLen == 0 ? string.Empty : _input.Substring(contentStart, unterminatedLen))
+                    : UnescapeQuotedString(inputSpan.Slice(contentStart, unterminatedLen));
+                return new Token(TokenType.StringLiteral, unterminated, startLine, startColumn);
             }
 
             // Numbers
             if (char.IsDigit(c) || (c == '.' && char.IsDigit(PeekAhead(1))))
             {
-                var sb = new StringBuilder();
+                int start = _position;
                 bool hasDot = false;
-                while (char.IsDigit(Peek()) || (Peek() == '.' && !hasDot))
+                while (_position < inputSpan.Length)
                 {
-                    if (Peek() == '.') hasDot = true;
-                    sb.Append(ReadChar());
+                    char nc = inputSpan[_position];
+                    if (char.IsDigit(nc))
+                    {
+                        ReadChar();
+                    }
+                    else if (nc == '.' && !hasDot)
+                    {
+                        hasDot = true;
+                        ReadChar();
+                    }
+                    else
+                    {
+                        break;
+                    }
                 }
-                return new Token(TokenType.NumberLiteral, sb.ToString(), startLine, startColumn);
+                return new Token(TokenType.NumberLiteral, _input.Substring(start, _position - start), startLine, startColumn);
             }
 
             // Identifiers / Keywords
             if (char.IsLetter(c) || c == '_')
             {
-                var sb = new StringBuilder();
-                while (char.IsLetterOrDigit(Peek()) || Peek() == '_')
+                int start = _position;
+                ReadChar();
+                while (_position < inputSpan.Length)
                 {
-                    sb.Append(ReadChar());
+                    char nc = inputSpan[_position];
+                    if (char.IsLetterOrDigit(nc) || nc == '_')
+                    {
+                        ReadChar();
+                    }
+                    else
+                    {
+                        break;
+                    }
                 }
-                string text = sb.ToString();
-                if (Keywords.TryGetValue(text, out var type))
+
+                int length = _position - start;
+                ReadOnlySpan<char> wordSpan = inputSpan.Slice(start, length);
+                if (TryMatchKeyword(wordSpan, out var kwType, out var canonical))
                 {
-                    return new Token(type, text, startLine, startColumn);
+                    return new Token(kwType, canonical, startLine, startColumn);
                 }
-                return new Token(TokenType.Identifier, text, startLine, startColumn);
+                return new Token(TokenType.Identifier, _input.Substring(start, length), startLine, startColumn);
             }
 
             // Multi-character Operators
@@ -285,15 +424,33 @@ namespace Glacier.Sql.Parser
                 case ')': return new Token(TokenType.CloseParenthesis, ")", startLine, startColumn);
                 case ',': return new Token(TokenType.Comma, ",", startLine, startColumn);
                 case '.': return new Token(TokenType.Dot, ".", startLine, startColumn);
+                case ';': return new Token(TokenType.Semicolon, ";", startLine, startColumn);
                 default:
                     return new Token(TokenType.Invalid, c.ToString(), startLine, startColumn);
             }
         }
 
-        private char PeekAhead(int offset)
+        private static string UnescapeQuotedString(ReadOnlySpan<char> raw)
         {
-            int index = _position + offset;
-            return index >= _input.Length ? '\0' : _input[index];
+            char[] rented = ArrayPool<char>.Shared.Rent(raw.Length);
+            try
+            {
+                int outIdx = 0;
+                for (int i = 0; i < raw.Length; i++)
+                {
+                    char ch = raw[i];
+                    rented[outIdx++] = ch;
+                    if (ch == '\'' && i + 1 < raw.Length && raw[i + 1] == '\'')
+                    {
+                        i++;
+                    }
+                }
+                return new string(rented, 0, outIdx);
+            }
+            finally
+            {
+                ArrayPool<char>.Shared.Return(rented);
+            }
         }
 
         private void SkipWhitespaceAndComments()

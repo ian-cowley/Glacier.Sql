@@ -3,6 +3,7 @@ using System.Collections.Concurrent;
 using System.IO;
 using Glacier.Polaris;
 using Glacier.Sql.Catalog;
+using Glacier.Sql.Diagnostics;
 using Glacier.Sql.Storage.Wal;
 
 namespace Glacier.Sql.Storage.BufferPool
@@ -17,7 +18,7 @@ namespace Glacier.Sql.Storage.BufferPool
             if (_disposed) throw new ObjectDisposedException(nameof(TableBufferPool));
             if (meta == null) throw new ArgumentNullException(nameof(meta));
 
-            return _buffers.GetOrAdd(meta.TableName, _ =>
+            var entry = _buffers.GetOrAdd(meta.TableName, _ =>
             {
                 DataFrame df;
                 if (File.Exists(meta.BackingFile))
@@ -28,8 +29,14 @@ namespace Glacier.Sql.Storage.BufferPool
                 {
                     df = TableStorage.CreateEmptyDataFrame(meta.Columns);
                 }
-                return new TableBufferEntry(meta.TableName, meta.BackingFile, df);
+                return new TableBufferEntry(meta.TableName, meta.BackingFile, df, tableId: meta.TableId);
             });
+
+            if (entry.TableId == Guid.Empty && meta.TableId != Guid.Empty)
+            {
+                entry.TableId = meta.TableId;
+            }
+            return entry;
         }
 
         public TableBufferEntry GetOrLoad(string tableName, string backingFile, Func<DataFrame>? loader = null)
@@ -54,6 +61,18 @@ namespace Glacier.Sql.Storage.BufferPool
                 }
                 return new TableBufferEntry(tableName, backingFile, df);
             });
+        }
+
+        internal void AttachEntry(TableBufferEntry entry)
+        {
+            if (_disposed) throw new ObjectDisposedException(nameof(TableBufferPool));
+            if (entry == null) throw new ArgumentNullException(nameof(entry));
+            _buffers[entry.TableName] = entry;
+        }
+
+        internal bool DetachEntry(string tableName, out TableBufferEntry? entry)
+        {
+            return _buffers.TryRemove(tableName, out entry);
         }
 
         public bool TryGet(string tableName, out TableBufferEntry? entry)
@@ -122,14 +141,16 @@ namespace Glacier.Sql.Storage.BufferPool
             if (walWriter != null)
             {
                 walWriter.AppendRecord(WalRecordType.CheckpointEnd, Guid.Empty, string.Empty, ReadOnlySpan<byte>.Empty);
-                if (highestFlushedLsn > 0)
+                ulong maxCandidate = highestFlushedLsn > 0 ? highestFlushedLsn : walWriter.CurrentLsn;
+                bool hasPending = AdvanceSafeCheckpointLsn(walWriter, maxCandidate);
+                if (!hasPending)
                 {
-                    AdvanceSafeCheckpointLsn(walWriter, highestFlushedLsn);
+                    walWriter.Truncate(Math.Max(walWriter.CheckpointLsn, walWriter.CurrentLsn));
                 }
             }
         }
 
-        internal void AdvanceSafeCheckpointLsn(WalWriter walWriter, ulong maxCandidateLsn)
+        internal bool AdvanceSafeCheckpointLsn(WalWriter walWriter, ulong maxCandidateLsn)
         {
             ulong minPendingLsn = ulong.MaxValue;
 
@@ -152,7 +173,8 @@ namespace Glacier.Sql.Storage.BufferPool
                 }
             }
 
-            ulong safeLsn = minPendingLsn == ulong.MaxValue
+            bool hasPending = minPendingLsn != ulong.MaxValue;
+            ulong safeLsn = !hasPending
                 ? maxCandidateLsn
                 : Math.Min(maxCandidateLsn, minPendingLsn - 1);
 
@@ -160,6 +182,8 @@ namespace Glacier.Sql.Storage.BufferPool
             {
                 walWriter.UpdateCheckpointLsn(safeLsn);
             }
+
+            return hasPending;
         }
 
         private static ulong FlushCommittedEntry(TableBufferEntry entry, WalWriter? walWriter)
@@ -167,6 +191,7 @@ namespace Glacier.Sql.Storage.BufferPool
             DataFrame snapshot;
             ulong lsn;
             string targetPath;
+            Guid tableId;
 
             using (entry.AcquireReadLock())
             {
@@ -178,6 +203,7 @@ namespace Glacier.Sql.Storage.BufferPool
                 snapshot = entry.CommittedSnapshot;
                 lsn = entry.LastCommittedLsn;
                 targetPath = entry.BackingFile;
+                tableId = entry.TableId;
             }
 
             string? dir = Path.GetDirectoryName(targetPath);
@@ -192,41 +218,38 @@ namespace Glacier.Sql.Storage.BufferPool
                 }
 
                 snapshot.WriteIpc(tmpPath);
+                File.Move(tmpPath, targetPath, overwrite: true);
 
-                if (Directory.Exists(dir))
+                using (entry.AcquireWriteLock())
                 {
-                    File.Move(tmpPath, targetPath, overwrite: true);
-
-                    using (entry.AcquireWriteLock())
+                    if (entry.LastCommittedLsn == lsn)
                     {
-                        if (entry.LastCommittedLsn == lsn)
+                        entry.HasUnflushedCommittedChanges = false;
+                        if (entry.ActiveTransactionId != Guid.Empty)
                         {
-                            entry.HasUnflushedCommittedChanges = false;
-                            if (entry.ActiveTransactionId != Guid.Empty)
-                            {
-                                entry.FirstUnflushedLsn = entry.FirstUncommittedTxLsn;
-                            }
-                            else
-                            {
-                                entry.FirstUnflushedLsn = 0;
-                                entry.IsDirty = false;
-                            }
+                            entry.FirstUnflushedLsn = entry.FirstUncommittedTxLsn;
+                        }
+                        else
+                        {
+                            entry.FirstUnflushedLsn = 0;
+                            entry.IsDirty = false;
                         }
                     }
-
-                    if (walWriter != null && lsn > 0)
-                    {
-                        Span<byte> lsnBytes = stackalloc byte[8];
-                        BitConverter.TryWriteBytes(lsnBytes, lsn);
-                        walWriter.AppendRecord(WalRecordType.CheckpointEnd, Guid.Empty, entry.TableName, lsnBytes);
-                    }
-
-                    return lsn;
                 }
+
+                if (walWriter != null && lsn > 0)
+                {
+                    Span<byte> lsnBytes = stackalloc byte[8];
+                    BitConverter.TryWriteBytes(lsnBytes, lsn);
+                    walWriter.AppendRecord(WalRecordType.CheckpointEnd, Guid.Empty, tableId, entry.TableName, lsnBytes);
+                }
+
+                return lsn;
             }
-            catch (Exception ex) when (ex is UnauthorizedAccessException or DirectoryNotFoundException or IOException)
+            catch (Exception ex)
             {
-                // Target directory may have been concurrently deleted or locked during cleanup
+                GlacierSqlDiagnostics.LogError($"Failed to flush table '{entry.TableName}' to '{targetPath}': {ex.Message}", ex);
+                throw;
             }
             finally
             {
@@ -235,8 +258,6 @@ namespace Glacier.Sql.Storage.BufferPool
                     try { File.Delete(tmpPath); } catch { }
                 }
             }
-
-            return 0;
         }
 
         public void Clear()

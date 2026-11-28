@@ -25,9 +25,16 @@ namespace Glacier.Sql.Parser
             { TokenType.Divide, 5 }
         };
 
-        private int GetPrecedence(TokenType type)
+        private int GetInfixPrecedence()
         {
-            if (InfixPrecedences.TryGetValue(type, out int precedence)) return precedence;
+            if (Current.Type == TokenType.Not && Peek.Type == TokenType.In)
+            {
+                return 3;
+            }
+            if (InfixPrecedences.TryGetValue(Current.Type, out int precedence))
+            {
+                return precedence;
+            }
             return 0;
         }
 
@@ -35,7 +42,7 @@ namespace Glacier.Sql.Parser
         {
             var left = ParsePrefixExpression();
 
-            while (precedence < GetPrecedence(Current.Type))
+            while (precedence < GetInfixPrecedence())
             {
                 left = ParseInfixExpression(left);
             }
@@ -164,30 +171,30 @@ namespace Glacier.Sql.Parser
                     return new SqlUnaryExpression("NOT", logOperand);
 
                 default:
-                    throw new Exception($"Unexpected token '{token.Text}' in expression at line {token.Line}, col {token.Column}");
+                    throw new SqlSyntaxException($"Unexpected token '{token.Text}' in expression at line {token.Line}, col {token.Column}", token.Line, token.Column);
             }
         }
 
         private SqlExpression ParseInfixExpression(SqlExpression left)
         {
             var opToken = Read();
-            int prec = GetPrecedence(opToken.Type);
+            bool isNegatedIn = false;
 
-            string opStr = opToken.Text;
-
-            if (opToken.Type == TokenType.Is && Match(TokenType.Not))
+            if (opToken.Type == TokenType.Not)
             {
-                opStr = "IS NOT";
+                Consume(TokenType.In, "Expected IN after NOT");
+                isNegatedIn = true;
             }
 
-            if (opToken.Type == TokenType.In)
+            if (opToken.Type == TokenType.In || isNegatedIn)
             {
                 Consume(TokenType.OpenParenthesis, "Expected '(' after IN");
+                SqlExpression inExpr;
                 if (Current.Type == TokenType.Select)
                 {
                     var sub = (SelectStatement)ParseSelect();
                     Consume(TokenType.CloseParenthesis);
-                    return new SqlInSubqueryExpression(left, sub);
+                    inExpr = new SqlInSubqueryExpression(left, sub);
                 }
                 else
                 {
@@ -199,8 +206,18 @@ namespace Glacier.Sql.Parser
                         break;
                     }
                     Consume(TokenType.CloseParenthesis);
-                    return new SqlInListExpression(left, list);
+                    inExpr = new SqlInListExpression(left, list);
                 }
+
+                return isNegatedIn ? new SqlUnaryExpression("NOT", inExpr) : inExpr;
+            }
+
+            int prec = InfixPrecedences[opToken.Type];
+            string opStr = opToken.Text;
+
+            if (opToken.Type == TokenType.Is && Match(TokenType.Not))
+            {
+                opStr = "IS NOT";
             }
 
             var right = ParseExpression(prec);

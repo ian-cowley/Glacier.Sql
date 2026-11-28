@@ -9,6 +9,9 @@ namespace Glacier.Sql.Storage.Wal
         TxCommit = 0x05,
         TxAbort = 0x06,
         CheckpointStart = 0x07,
-        CheckpointEnd = 0x08
+        CheckpointEnd = 0x08,
+        RowDeleteDelta = 0x09,
+        RowUpdateDelta = 0x0A,
+        TableDrop = 0x0B
     }
 }

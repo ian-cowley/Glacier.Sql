@@ -3,7 +3,7 @@ using System;
 namespace Glacier.Sql.Storage.Wal
 {
     /// <summary>
-    /// Fast IEEE 802.3 32-bit Cyclic Redundancy Check (CRC32).
+    /// Hardware-accelerated IEEE 802.3 32-bit Cyclic Redundancy Check (CRC32, polynomial 0xEDB88320).
     /// </summary>
     public static class Crc32
     {
@@ -29,17 +29,16 @@ namespace Glacier.Sql.Storage.Wal
 
         public static uint Compute(ReadOnlySpan<byte> data)
         {
-            uint crc = 0xFFFFFFFFu;
-            for (int i = 0; i < data.Length; i++)
-            {
-                byte index = (byte)((crc & 0xFF) ^ data[i]);
-                crc = (crc >> 8) ^ Table[index];
-            }
-            return ~crc;
+            return System.IO.Hashing.Crc32.HashToUInt32(data);
         }
 
         public static uint Update(uint currentCrc, ReadOnlySpan<byte> data)
         {
+            if (currentCrc == 0)
+            {
+                return System.IO.Hashing.Crc32.HashToUInt32(data);
+            }
+
             uint crc = ~currentCrc;
             for (int i = 0; i < data.Length; i++)
             {

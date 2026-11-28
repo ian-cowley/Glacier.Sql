@@ -17,13 +17,13 @@
 
 ## Features
 
-- **T-SQL Parser & AST**: Custom Pratt/recursive-descent tokenizer and parser implementing `SELECT` (with `GROUP BY`, `HAVING`, `ORDER BY`, `TOP`, `JOIN`), `INSERT`, `INSERT ... SELECT`, `UPDATE`, `DELETE`, `CREATE`, `ALTER`, and `DROP`, including bracketed identifiers (`[col 1]`), signed/64-bit numeric literals, and constant scalar expressions.
-- **Post-Aggregate `HAVING` & `ORDER BY`**: Full aggregate extraction and deduplication across `SELECT`, `HAVING`, and `ORDER BY` — supporting projected and unprojected aggregates (`HAVING COUNT(*) > 2`), compound `AND`/`OR` predicates, projection aliases, and global aggregate filtering.
-- **Deterministic WAL & Crash Recovery**: Physical Arrow IPC mutation logging (`RowInsert` deltas and `RowUpdate`/`RowDelete` post-mutation snapshots) protected by 32-byte header CRC32 + per-frame CRC32 validation, monotonic LSN recovery across restarts, per-table `CheckpointEnd` watermarks, and uncommitted transaction isolation during checkpoints.
-- **Async-Native Concurrency (`AsyncReaderWriterLock`)**: Fair, non-blocking async reader-writer table locks with deadlock-safe `UpgradeReadToWriteAsync`, canonical multi-table lock ordering across joins/views/subqueries, and re-entrant trigger execution contexts.
-- **Native Triggers & Relational Views**: Persistent `AFTER` and `INSTEAD OF` triggers with `inserted`/`deleted` virtual tables, plus catalog-persisted views recursively inlined into query plans.
-- **Correlated Subqueries**: Scalar subqueries, `IN (...)` subqueries, and correlated `EXISTS` / `NOT EXISTS` compiled to Polaris `Semi` / `Anti` joins without mutating cached ASTs.
-- **Native AOT Ready**: Source-generated `System.Text.Json` contexts (`CatalogJsonContext` and `SqlMcpJsonContext`) across both `Glacier.Sql` and `Glacier.Sql.Host` with `<IsAotCompatible>true</IsAotCompatible>` and `<TreatWarningsAsErrors>true</TreatWarningsAsErrors>`.
+- **T-SQL Parser & AST**: Zero-allocation `ReadOnlySpan<char>` & ASCII-folding byte-Trie `SqlLexer` and Pratt/recursive-descent `TSqlParser` (with `SqlSyntaxException`, strict `EOF` checking, and `;` terminators) implementing `SELECT` (with `GROUP BY`, `HAVING`, `ORDER BY` expressions, `TOP`, `INNER`/`LEFT [OUTER]`/`RIGHT [OUTER]`/`FULL [OUTER]`/`CROSS JOIN`), multi-row `INSERT ... VALUES (...), (...)`, `INSERT ... SELECT`, `UPDATE`, `DELETE`, `CREATE`/`ALTER`/`DROP TABLE`, `CREATE`/`DROP VIEW`, `CREATE`/`DROP TRIGGER`, and `BEGIN`/`COMMIT`/`ROLLBACK TRANSACTION`.
+- **Post-Aggregate & Standard `HAVING` / `ORDER BY`**: Full aggregate extraction and deduplication across `SELECT`, `HAVING`, and `ORDER BY` — supporting projected and unprojected aggregates (`HAVING COUNT(*) > 2`), compound `AND`/`OR` predicates, non-aggregate `HAVING` & `ORDER BY` expressions, projection aliases, and global aggregate filtering.
+- **Deterministic WAL v2 & Crash Recovery**: Hardware-accelerated IEEE 802.3 CRC32 (`System.IO.Hashing.Crc32`), `Guid TableId`-keyed WAL v2 frames (preventing drop+recreate replay corruption), compact `RowDeleteDelta`/`RowUpdateDelta` row-ID records, $O(1)$ amortized chunked `INSERT` buffering, fail-closed header validation, monotonic LSN recovery across restarts, automatic WAL truncation on clean checkpoints, and uncommitted transaction isolation (including transactional DDL & auto-commit `AFTER` trigger rollback).
+- **Async-Native Concurrency (`AsyncReaderWriterLock`)**: Fair, non-blocking async reader-writer table locks with deadlock-safe `UpgradeReadToWriteAsync`, canonical multi-table lock ordering across joins/views/subqueries, locked `INSTEAD OF` triggers, and re-entrant trigger execution contexts.
+- **Native Triggers & Relational Views**: Persistent `AFTER` and `INSTEAD OF` triggers (with `INSTEAD OF UPDATE` running prior to base table constraints) using `inserted`/`deleted` virtual tables, plus catalog-persisted views with AST/schema caching.
+- **Correlated Subqueries & Set Membership**: Scalar subqueries, semi-join/hash `IN` / `NOT IN` (with SQL 3-valued `NULL` semantics), and recursive `EXISTS` / `NOT EXISTS` / `OR EXISTS` supporting multi-column and non-`Int32` correlations.
+- **Native AOT & MCP Host**: Source-generated `System.Text.Json` contexts (`CatalogJsonContext` and `SqlMcpJsonContext`) across `Glacier.Sql` and `Glacier.Sql.Host`, isolated via `GLACIER_SQL_DATA_DIR`, gated logging (`GLACIER_SQL_MCP_LOG`), `isError` reporting, and `maxResults`/`offset` pagination.
 
 ---
 
@@ -120,6 +120,9 @@ The executable host runs a Native AOT-compatible JSON-RPC Model Context Protocol
 ```bash
 dotnet run --project src/Glacier.Sql.Host/Glacier.Sql.Host.csproj -c Release
 ```
+- **Data Directory**: Resolved via `--data-dir <path>` -> `GLACIER_SQL_DATA_DIR` environment variable -> `%LOCALAPPDATA%/Glacier/Sql/Data` (never writes `Data/` into `AppContext.BaseDirectory`).
+- **Diagnostic Logging**: Disabled by default. Set `GLACIER_SQL_MCP_LOG=1` (writes inside the resolved data directory) or an explicit file path to enable `mcp_sql_log.txt`.
+- **Pagination**: `execute_sql` accepts optional `maxResults` (default `200`, max `1000`) and `offset` (default `0`) arguments.
 
 ---
 
@@ -130,13 +133,12 @@ dotnet run --project src/Glacier.Sql.Host/Glacier.Sql.Host.csproj -c Release
 
 ---
 
-## 🆕 What's New in v1.1.0
+## 🆕 What's New in v1.1.1
 
-- **Complete `HAVING` & Post-Aggregate `ORDER BY` Pipeline** — Supports projected and unprojected aggregates (`HAVING COUNT(*) > 2`), compound boolean expressions, `SELECT` aliases, global aggregate `HAVING`, and post-group sorting without leaking internal helper columns.
-- **Fair Async-Native Locking (`AsyncReaderWriterLock`)** — Replaces sync-over-async `SemaphoreSlim` hacks with handle-scoped `LockReleaser` ownership, deadlock-safe read-to-write lock upgrades, canonical multi-table lock ordering across views/subqueries, and serialized DML read-modify-write execution (zero lost updates).
-- **Physical Arrow IPC WAL & Monotonic Crash Recovery** — `RowUpdate` and `RowDelete` now persist deterministic Arrow IPC snapshots rather than raw SQL text; `WalWriter`/`WalReader` validate 32-byte header CRC32 checksums, restore monotonic `_currentLsn` across multi-crash restarts, and isolate uncommitted transactions during checkpoints.
-- **Native AOT & Strict Build Hygiene** — Enabled `<IsAotCompatible>true</IsAotCompatible>` and `<TreatWarningsAsErrors>true</TreatWarningsAsErrors>` with source-generated JSON contexts (`CatalogJsonContext`, `SqlMcpJsonContext`) and zero transitive NuGet vulnerabilities.
-- **59 unit & adversarial stress tests** passing (100% green).
+- **Hardened Concurrency, Triggers & Transactional DDL** — Exclusive locking on `INSTEAD OF INSERT`, `INSTEAD OF UPDATE` ordered before constraint checks, automatic implicit-transaction rollback on failing `AFTER` triggers, LIFO transaction rollback, and full transactional DDL (`CREATE`/`DROP`/`ALTER TABLE`, `CREATE`/`DROP VIEW`, `CREATE`/`DROP TRIGGER`).
+- **WAL v2, Hardware CRC32 & $O(1)$ Delta Buffering** — `System.IO.Hashing.Crc32` hardware acceleration, `Guid TableId`-keyed WAL v2 frames (immune to drop+recreate replay), compact `RowDeleteDelta`/`RowUpdateDelta` frames, `ArrayPool` WAL buffering, checkpoint WAL truncation, fail-closed corrupt `catalog.json`/WAL header guards, and chunked `TableBufferEntry` appends.
+- **Span/Trie Lexer, Planner & MCP Host Hardening** — Zero-alloc `ReadOnlySpan<char>` + byte-Trie `SqlLexer`, `SqlSyntaxException` with `EOF` enforcement, multi-row `INSERT`, `NOT IN` 3-valued `NULL` handling, `COUNT(*)` NULL accuracy, multi-key/OR `EXISTS`, `RIGHT`/`FULL`/`LEFT OUTER` & swapped `ON` joins, async planner (`PlanQueryAsync`), view AST/schema caching, and `GLACIER_SQL_DATA_DIR` + `maxResults`/`offset` host isolation.
+- **81 unit, concurrency & durability tests** passing (100% green).
 
 ---
 

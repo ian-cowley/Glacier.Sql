@@ -49,17 +49,37 @@ namespace Glacier.Sql.Parser
         }
     }
 
+    public class DropTriggerStatement : SqlStatement
+    {
+        public string TriggerName { get; }
+
+        public DropTriggerStatement(string triggerName)
+        {
+            TriggerName = triggerName;
+        }
+    }
+
     public class InsertStatement : SqlStatement
     {
         public string TableName { get; }
         public List<string>? Columns { get; }
         public List<SqlExpression> Values { get; }
+        public List<List<SqlExpression>> Rows { get; }
 
         public InsertStatement(string tableName, List<string>? columns, List<SqlExpression> values)
         {
             TableName = tableName;
             Columns = columns;
             Values = values;
+            Rows = new List<List<SqlExpression>> { values };
+        }
+
+        public InsertStatement(string tableName, List<string>? columns, List<List<SqlExpression>> rows)
+        {
+            TableName = tableName;
+            Columns = columns;
+            Rows = rows ?? throw new ArgumentNullException(nameof(rows));
+            Values = rows.Count > 0 ? rows[0] : new List<SqlExpression>();
         }
     }
 
@@ -168,7 +188,7 @@ namespace Glacier.Sql.Parser
     public class SqlJoin : SqlNode
     {
         public SqlTableRef Table { get; }
-        public string JoinType { get; } // "INNER", "LEFT", "CROSS"
+        public string JoinType { get; } // "INNER", "LEFT", "RIGHT", "FULL", "CROSS"
         public SqlExpression? On { get; set; }
 
         public SqlJoin(SqlTableRef table, string joinType, SqlExpression? on = null)

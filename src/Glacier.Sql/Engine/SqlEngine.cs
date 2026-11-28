@@ -4,6 +4,7 @@ using System.Linq;
 using System.Threading.Tasks;
 using Glacier.Polaris;
 using Glacier.Sql.Catalog;
+using Glacier.Sql.Diagnostics;
 using Glacier.Sql.Parser;
 using Glacier.Sql.Storage.BufferPool;
 
@@ -62,6 +63,7 @@ namespace Glacier.Sql.Engine
         public bool IsActive { get; private set; } = true;
 
         private readonly List<Action> _rollbacks = new();
+        private readonly List<Action> _commits = new();
         private readonly List<TransactionLockInfo> _heldLocks = new();
         private readonly HashSet<string> _backedUpTables = new(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, TableBufferEntry> _mutatedEntries = new(StringComparer.OrdinalIgnoreCase);
@@ -84,7 +86,18 @@ namespace Glacier.Sql.Engine
 
         public void RegisterRollback(Action action)
         {
-            _rollbacks.Add(action);
+            if (action != null)
+            {
+                _rollbacks.Add(action);
+            }
+        }
+
+        public void RegisterCommit(Action action)
+        {
+            if (action != null)
+            {
+                _commits.Add(action);
+            }
         }
 
         public void RegisterLock(
@@ -109,46 +122,99 @@ namespace Glacier.Sql.Engine
         public void Commit(ulong commitLsn = 0)
         {
             IsActive = false;
+            Exception? firstError = null;
 
-            foreach (var entry in _mutatedEntries.Values)
+            try
             {
-                try
+                foreach (var entry in _mutatedEntries.Values)
                 {
-                    entry.CommitTransaction(TransactionGuid, commitLsn);
+                    try
+                    {
+                        entry.CommitTransaction(TransactionGuid, commitLsn);
+                    }
+                    catch (Exception ex)
+                    {
+                        GlacierSqlDiagnostics.LogError($"Error committing buffer entry '{entry.TableName}' in tx {TransactionGuid}: {ex.Message}", ex);
+                        firstError ??= ex;
+                    }
                 }
-                catch { }
+
+                for (int i = 0; i < _commits.Count; i++)
+                {
+                    try
+                    {
+                        _commits[i]();
+                    }
+                    catch (Exception ex)
+                    {
+                        GlacierSqlDiagnostics.LogError($"Error executing commit callback in tx {TransactionGuid}: {ex.Message}", ex);
+                        firstError ??= ex;
+                    }
+                }
+
+                _mutatedEntries.Clear();
+                _rollbacks.Clear();
+                _commits.Clear();
+                _backedUpTables.Clear();
+            }
+            finally
+            {
+                ReleaseHeldLocks();
             }
 
-            _mutatedEntries.Clear();
-            _rollbacks.Clear();
-            _backedUpTables.Clear();
-
-            ReleaseHeldLocks();
+            if (firstError != null)
+            {
+                throw new AggregateException($"One or more errors occurred while committing transaction {TransactionGuid}.", firstError);
+            }
         }
 
         public void Rollback()
         {
             IsActive = false;
+            Exception? firstError = null;
 
-            foreach (var entry in _mutatedEntries.Values)
+            try
             {
-                try
+                foreach (var entry in _mutatedEntries.Values)
                 {
-                    entry.RollbackTransaction(TransactionGuid);
+                    try
+                    {
+                        entry.RollbackTransaction(TransactionGuid);
+                    }
+                    catch (Exception ex)
+                    {
+                        GlacierSqlDiagnostics.LogError($"Error rolling back buffer entry '{entry.TableName}' in tx {TransactionGuid}: {ex.Message}", ex);
+                        firstError ??= ex;
+                    }
                 }
-                catch { }
-            }
 
-            foreach (var action in _rollbacks)
+                for (int i = _rollbacks.Count - 1; i >= 0; i--)
+                {
+                    try
+                    {
+                        _rollbacks[i]();
+                    }
+                    catch (Exception ex)
+                    {
+                        GlacierSqlDiagnostics.LogError($"Error executing rollback callback in tx {TransactionGuid}: {ex.Message}", ex);
+                        firstError ??= ex;
+                    }
+                }
+
+                _mutatedEntries.Clear();
+                _rollbacks.Clear();
+                _commits.Clear();
+                _backedUpTables.Clear();
+            }
+            finally
             {
-                try { action(); } catch { }
+                ReleaseHeldLocks();
             }
 
-            _mutatedEntries.Clear();
-            _rollbacks.Clear();
-            _backedUpTables.Clear();
-
-            ReleaseHeldLocks();
+            if (firstError != null)
+            {
+                throw new AggregateException($"One or more errors occurred while rolling back transaction {TransactionGuid}.", firstError);
+            }
         }
 
         private void ReleaseHeldLocks()
@@ -159,7 +225,10 @@ namespace Glacier.Sql.Engine
                 {
                     _heldLocks[i].Releaser.Dispose();
                 }
-                catch { }
+                catch (Exception ex)
+                {
+                    GlacierSqlDiagnostics.LogError($"Error releasing lock on '{_heldLocks[i].TableName}' in tx {TransactionGuid}: {ex.Message}", ex);
+                }
             }
             _heldLocks.Clear();
         }
@@ -285,6 +354,7 @@ namespace Glacier.Sql.Engine
             }
             catch (Exception ex)
             {
+                GlacierSqlDiagnostics.LogError($"SQL execution error: {ex.Message}", ex);
                 return ExecuteResult.Error($"Execution Error: {ex.Message}");
             }
         }
@@ -301,7 +371,7 @@ namespace Glacier.Sql.Engine
                 switch (stmt)
                 {
                     case CreateTableStatement create:
-                        return ExecuteCreate(create, context);
+                        return await ExecuteCreate(create, context);
 
                     case DropTableStatement drop:
                         return await ExecuteDrop(drop, context);
@@ -310,10 +380,10 @@ namespace Glacier.Sql.Engine
                         return await ExecuteAlter(alter, context);
 
                     case CreateViewStatement createView:
-                        return ExecuteCreateView(createView, context);
+                        return await ExecuteCreateView(createView, context);
 
                     case DropViewStatement dropView:
-                        return ExecuteDropView(dropView, context);
+                        return await ExecuteDropView(dropView, context);
 
                     case InsertStatement insert:
                         return await ExecuteInsert(insert, context);
@@ -337,7 +407,10 @@ namespace Glacier.Sql.Engine
                         return ExecuteRollbackTransaction(rollback, context);
 
                     case CreateTriggerStatement createTrigger:
-                        return ExecuteCreateTrigger(createTrigger, context);
+                        return await ExecuteCreateTrigger(createTrigger, context);
+
+                    case DropTriggerStatement dropTrigger:
+                        return await ExecuteDropTrigger(dropTrigger, context);
 
                     case InsertSelectStatement insertSelect:
                         return await ExecuteInsertSelect(insertSelect, context, inserted, deleted);
@@ -348,7 +421,8 @@ namespace Glacier.Sql.Engine
             }
             catch (Exception ex)
             {
-                return ExecuteResult.Error($"Execution Error: {ex}");
+                GlacierSqlDiagnostics.LogError($"Statement execution error: {ex.Message}", ex);
+                return ExecuteResult.Error($"Execution Error: {ex.Message}");
             }
         }
     }

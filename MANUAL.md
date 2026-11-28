@@ -142,9 +142,11 @@ DML statements modify row data.
 Inserts one or more rows into a table.
 
 #### Positional Insertion
-Inserts a row by mapping values directly to schema columns in order.
+Inserts one or more rows by mapping values directly to schema columns in order:
 ```sql
-INSERT INTO customers VALUES (1, 'Alice', 'alice@test.com', 30);
+INSERT INTO customers VALUES
+    (1, 'Alice', 'alice@test.com', 30),
+    (2, 'Carla', 'carla@test.com', 28);
 ```
 
 #### Explicit Column Insertion
@@ -208,10 +210,11 @@ Queries are translated into Polaris `LazyFrame` chains and executed.
 ```sql
 SELECT [TOP n] projection_list
 FROM table_source
-[JOIN join_source ON join_condition]
+[INNER | LEFT [OUTER] | RIGHT [OUTER] | FULL [OUTER] | CROSS JOIN join_source [ON join_condition]]
 [WHERE filter_condition]
 [GROUP BY group_columns]
-[ORDER BY sort_column [ASC | DESC]]
+[HAVING having_condition]
+[ORDER BY sort_expression [ASC | DESC]]
 ```
 
 ---
@@ -238,7 +241,9 @@ SELECT COUNT(*) AS total_customers, AVG(age) AS average_age FROM customers;
 Combines columns from multiple tables.
 
 - **`INNER JOIN`**: Returns rows with matching values in both tables.
-- **`LEFT JOIN`**: Returns all rows from the left table, with matching rows from the right table (padded with `NULL` if no match).
+- **`LEFT [OUTER] JOIN`**: Returns all rows from the left table, with matching rows from the right table (padded with `NULL` if no match).
+- **`RIGHT [OUTER] JOIN`**: Returns all rows from the right table, with matching rows from the left table (padded with `NULL` if no match).
+- **`FULL [OUTER] JOIN`**: Returns all rows from both tables, padding unmatched columns on either side with `NULL`.
 - **`CROSS JOIN`**: Returns the Cartesian product of the two tables.
 
 #### Syntax
@@ -283,9 +288,9 @@ DROP VIEW active_customers;
 ```
 
 ### 6.2 View Expansion in Query Planner
-When a query references a view, the query planner intercepts the source name, reads the view definition from the catalog, compiles the view's query to a `LazyFrame`, and inlines it in place of the table source.
+When a query references a view, the query planner intercepts the source name, reads the cached view AST/definition from the catalog, compiles the view's query to a `LazyFrame`, and inlines it in place of the table source.
 ```sql
-SELECT * FROM active_customers WHERE name LIKE 'A%';
+SELECT * FROM active_customers WHERE age >= 21;
 ```
 
 ---
@@ -303,8 +308,8 @@ WHERE age = (SELECT MAX(age) FROM customers);
 
 ---
 
-### 7.2 List Membership (`IN`)
-Evaluated by compiling the inner subquery, collecting the results, and expanding it into a logical chain of equality checks (`OR`).
+### 7.2 List Membership (`IN` / `NOT IN`)
+Evaluated using vectorized hash-set membership (`IsIn`) with SQL 3-valued `NULL` logic (`NOT IN` returns no rows if the right-hand set or subquery contains `NULL`).
 
 #### Subquery Membership
 ```sql
@@ -315,23 +320,18 @@ WHERE customer_id IN (SELECT customer_id FROM orders WHERE amount > 100);
 #### Static List Membership
 ```sql
 SELECT name FROM customers 
-WHERE customer_id IN (1, 2, 3);
+WHERE customer_id NOT IN (1, 2, 3);
 ```
 
 ---
 
 ### 7.3 Existential Qualifiers (`EXISTS` / `NOT EXISTS`)
-Existential subqueries are compiled using joins to avoid row-by-row scans.
-
-#### Correlated EXISTS (Semi-Join)
-The planner identifies correlation expressions (like `t_b.customer_id = t_a.customer_id`), removes them from the subquery's `WHERE` filter, and converts the operation into an inner **`Semi` Join** on the correlation key.
+Existential subqueries support single- and multi-column correlations, boolean combinations (`AND` / `OR` / `NOT`), and arbitrary key types.
 ```sql
 SELECT val FROM t_a 
 WHERE EXISTS (SELECT * FROM t_b WHERE t_b.id = t_a.id AND score >= 90);
 ```
 
-#### Correlated NOT EXISTS (Anti-Join)
-Similar to `EXISTS`, but converts the operation into an inner **`Anti` Join**, returning only rows in the outer table that have no matches in the subquery.
 ```sql
 SELECT val FROM t_a 
 WHERE NOT EXISTS (SELECT * FROM t_b WHERE t_b.id = t_a.id);
@@ -341,21 +341,20 @@ WHERE NOT EXISTS (SELECT * FROM t_b WHERE t_b.id = t_a.id);
 
 ## 8. Transactions & Crash Recovery
 
-Glacier.Sql guarantees ACID properties using a shadowed table file log.
+Glacier.Sql guarantees ACID properties using an in-memory `TableBufferPool` paired with a CRC32-verified binary Write-Ahead Log (`glacier.wal`, WAL v2 keyed by `Guid TableId`) and Arrow IPC table checkpoints (`*.ipc`).
 
 ```text
 1. Transaction Start (BEGIN TRANSACTION)
-   ├── Backup catalog and metadata
-   └── Lock target tables
+   └── Logs TxBegin and acquires canonical table locks on demand
 
-2. DML Execution (INSERT, UPDATE, DELETE)
-   ├── Read original table file
-   ├── Write modifications to a temporary shadow file (.tmp)
-   └── Route subsequent reads to shadow files
+2. DML & Transactional DDL Execution
+   ├── TableBufferEntry stages uncommitted chunked appends / mutations in memory
+   ├── WAL appends RowInsert / RowUpdateDelta / RowDeleteDelta tagged with TxId
+   └── DDL (CREATE/DROP/ALTER TABLE, VIEW, TRIGGER) defers disk/catalog persistence until COMMIT
 
 3. Transaction End
-   ├── COMMIT   ──> Swap shadow files to primary, delete backups
-   └── ROLLBACK ──> Delete shadow files, restore original state
+   ├── COMMIT   ──> Appends TxCommit (fsync), promotes CommittedSnapshot, runs commit callbacks, releases locks
+   └── ROLLBACK ──> Appends TxAbort, restores CommittedSnapshot, executes DDL undo callbacks in LIFO order, releases locks
 ```
 
 ### 8.1 Transaction Syntax
@@ -367,12 +366,10 @@ COMMIT; -- Or ROLLBACK;
 ```
 
 ### 8.2 Crash Recovery
-If the server crashes during a transaction:
-1. On startup, `CatalogManager.Load()` checks for any remaining transaction logs.
-2. If incomplete transactions are found, it rolls them back:
-   - Deletes all temporary shadow files.
-   - Restores catalog states from the backup configurations.
-   - Restores database integrity.
+On startup, `CatalogManager.Load()` validates `catalog.json` and `glacier.wal` headers (failing closed with `InvalidDataException` on header corruption):
+1. `WalReader` validates the 32-byte IEEE 802.3 CRC32 header and scans valid frames, cleanly halting at any torn EOF write.
+2. `CatalogManager.RecoverFromWal()` replays committed mutations (`TxId == Guid.Empty` or matching `TxCommit`) matching active `TableId`s past the checkpoint LSN, skipping aborted or uncommitted transactions and dropped tables.
+3. `Checkpoint()` flushes dirty `CommittedSnapshot`s atomically to `.ipc` files and truncates `glacier.wal` back to its 32-byte header when no pending transactions remain.
 
 ---
 
@@ -414,24 +411,21 @@ INSERT into Table A
 
 ---
 
-### 9.4 Transaction Integration
-If a DML statement runs within an active transaction, all modifications made by its triggers (e.g. audit logging, inserts into shadow tables) are written to the transaction's shadow files.
-If the transaction is rolled back, all trigger modifications are rolled back.
+### 9.4 Transaction Integration & `DROP TRIGGER`
+Auto-commit DML statements on tables with `AFTER` triggers automatically execute inside an implicit transaction so any trigger failure rolls back both base and nested mutations atomically. Persistent triggers can be removed with `DROP TRIGGER trigger_name;`.
 
 ---
 
 ## 10. Concurrency Locking Model
 
-To ensure isolation across asynchronous operations, Glacier.Sql uses a custom locking model.
+To ensure isolation across asynchronous operations, Glacier.Sql uses a fair async-native locking model.
 
-### 10.1 Thread-Independent RW Lock
-C#'s `ReaderWriterLockSlim` enforces thread-affinity, meaning the thread that acquires a lock must be the one that releases it. Because .NET's `async/await` tasks can resume on different thread pool threads, using `ReaderWriterLockSlim` causes deadlocks or exceptions in async pipelines.
-
-To resolve this, Glacier.Sql implements `ThreadIndependentReaderWriterLock`. It manages active locks using an async-friendly semaphore queue, allowing lock acquisition and release to span across multiple thread contexts safely.
+### 10.1 `AsyncReaderWriterLock`
+C#'s `ReaderWriterLockSlim` enforces thread-affinity, meaning the thread that acquires a lock must be the one that releases it. Because .NET's `async/await` tasks can resume on different thread pool threads, Glacier.Sql implements `AsyncReaderWriterLock` using `TaskCompletionSource<bool>` queues with per-handle `LockReleaser` ownership and deadlock-safe `UpgradeReadToWriteAsync`.
 
 ### 10.2 Lock Escalation
 - **Shared Read Locks**: Acquired during `SELECT` statements.
-- **Exclusive Write Locks**: Acquired during `INSERT`, `UPDATE`, `DELETE`, `CREATE`, `DROP`, and `ALTER TABLE` statements.
+- **Exclusive Write Locks**: Acquired during `INSERT`, `UPDATE`, `DELETE`, `CREATE`, `DROP`, and `ALTER` statements (including `INSTEAD OF` triggers and `CREATE`/`DROP VIEW`/`TRIGGER`).
 - **Transaction Scope**: Shared and exclusive locks are held for the duration of a transaction and released only when `COMMIT` or `ROLLBACK` is executed.
 
 ---
@@ -450,7 +444,7 @@ Exposes a list of tables registered in the database catalog.
 ```sql
 SELECT TABLE_NAME 
 FROM INFORMATION_SCHEMA.TABLES 
-WHERE TABLE_NAME LIKE 'test%';
+WHERE TABLE_NAME = 'customers';
 ```
 
 ---

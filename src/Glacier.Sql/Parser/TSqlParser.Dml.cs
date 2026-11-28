@@ -107,18 +107,26 @@ namespace Glacier.Sql.Parser
             }
 
             Consume(TokenType.Values, "Expected VALUES keyword");
-            Consume(TokenType.OpenParenthesis, "Expected '(' before VALUES list");
 
-            var values = new List<SqlExpression>();
+            var rows = new List<List<SqlExpression>>();
             while (true)
             {
-                values.Add(ParseExpression(0));
+                Consume(TokenType.OpenParenthesis, "Expected '(' before VALUES list");
+                var values = new List<SqlExpression>();
+                while (true)
+                {
+                    values.Add(ParseExpression(0));
+                    if (Match(TokenType.Comma)) continue;
+                    break;
+                }
+                Consume(TokenType.CloseParenthesis, "Expected ')' to close VALUES list");
+                rows.Add(values);
+
                 if (Match(TokenType.Comma)) continue;
                 break;
             }
 
-            Consume(TokenType.CloseParenthesis, "Expected ')' to close VALUES list");
-            return new InsertStatement(tableName, columns, values);
+            return new InsertStatement(tableName, columns, rows);
         }
 
         private SqlStatement ParseSelect()
@@ -138,7 +146,7 @@ namespace Glacier.Sql.Parser
             {
                 var expr = ParseExpression(0);
                 string? alias = null;
-                
+
                 if (Match(TokenType.As))
                 {
                     alias = Consume(TokenType.Identifier, "Expected alias identifier after AS").Text;
@@ -165,17 +173,30 @@ namespace Glacier.Sql.Parser
                     string? joinType = null;
                     if (Match(TokenType.Inner))
                     {
-                        Consume(TokenType.Join);
+                        Consume(TokenType.Join, "Expected JOIN after INNER");
                         joinType = "INNER";
                     }
                     else if (Match(TokenType.Left))
                     {
+                        Match(TokenType.Outer);
                         if (Current.Type == TokenType.Join) Consume(TokenType.Join);
                         joinType = "LEFT";
                     }
+                    else if (Match(TokenType.Right))
+                    {
+                        Match(TokenType.Outer);
+                        Consume(TokenType.Join, "Expected JOIN after RIGHT");
+                        joinType = "RIGHT";
+                    }
+                    else if (Match(TokenType.Full))
+                    {
+                        Match(TokenType.Outer);
+                        Consume(TokenType.Join, "Expected JOIN after FULL");
+                        joinType = "FULL";
+                    }
                     else if (Match(TokenType.Cross))
                     {
-                        Consume(TokenType.Join);
+                        Consume(TokenType.Join, "Expected JOIN after CROSS");
                         joinType = "CROSS";
                     }
                     else if (Current.Type == TokenType.Join)
@@ -257,9 +278,7 @@ namespace Glacier.Sql.Parser
             {
                 alias = Consume(TokenType.Identifier, "Expected table alias").Text;
             }
-            else if (Current.Type == TokenType.Identifier && Current.Type != TokenType.Join && 
-                     Current.Type != TokenType.Inner && Current.Type != TokenType.Left && Current.Type != TokenType.Cross &&
-                     Current.Type != TokenType.Where && Current.Type != TokenType.Group && Current.Type != TokenType.Order)
+            else if (Current.Type == TokenType.Identifier)
             {
                 alias = Consume(TokenType.Identifier).Text;
             }

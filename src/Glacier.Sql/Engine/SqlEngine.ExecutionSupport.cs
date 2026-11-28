@@ -1,11 +1,14 @@
 using System;
+using System.Buffers;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
+using System.Text;
 using System.Threading.Tasks;
 using Glacier.Polaris;
 using Glacier.Polaris.Data;
 using Glacier.Sql.Catalog;
+using Glacier.Sql.Diagnostics;
 using Glacier.Sql.Parser;
 using Glacier.Sql.Storage.BufferPool;
 using Glacier.Sql.Storage.Wal;
@@ -24,20 +27,6 @@ namespace Glacier.Sql.Engine
             if (!context.ActiveTransaction.HasBackedUpTable(meta.TableName))
             {
                 context.ActiveTransaction.RegisterBackedUpTable(meta.TableName);
-
-                DataFrame preTxSnapshot;
-                using (entry.AcquireReadLock())
-                {
-                    preTxSnapshot = entry.CurrentSnapshot;
-                }
-
-                context.ActiveTransaction.RegisterRollback(() =>
-                {
-                    using (entry.AcquireWriteLock())
-                    {
-                        entry.CurrentSnapshot = preTxSnapshot;
-                    }
-                });
             }
         }
 
@@ -63,8 +52,8 @@ namespace Glacier.Sql.Engine
             }
             var tx = context.ActiveTransaction;
             ulong commitLsn = context.Catalog.WalWriter.AppendRecord(WalRecordType.TxCommit, tx.TransactionGuid, string.Empty, ReadOnlySpan<byte>.Empty);
-            tx.Commit(commitLsn);
             context.ActiveTransaction = null;
+            tx.Commit(commitLsn);
             return ExecuteResult.Ok("Transaction committed.", 0);
         }
 
@@ -77,12 +66,12 @@ namespace Glacier.Sql.Engine
             }
             var tx = context.ActiveTransaction;
             context.Catalog.WalWriter.AppendRecord(WalRecordType.TxAbort, tx.TransactionGuid, string.Empty, ReadOnlySpan<byte>.Empty);
-            tx.Rollback();
             context.ActiveTransaction = null;
+            tx.Rollback();
             return ExecuteResult.Ok("Transaction rolled back.", 0);
         }
 
-        private ExecuteResult ExecuteCreateTrigger(CreateTriggerStatement createTrigger, ExecutionContext context)
+        private async Task<ExecuteResult> ExecuteCreateTrigger(CreateTriggerStatement createTrigger, ExecutionContext context)
         {
             var catalog = context.Catalog;
             if (!catalog.TableExists(createTrigger.TableName))
@@ -90,17 +79,81 @@ namespace Glacier.Sql.Engine
                 return ExecuteResult.Error($"Table '{createTrigger.TableName}' does not exist for trigger.");
             }
 
-            var trigMeta = new TriggerMetadata
+            using (await AcquireLockAsync(createTrigger.TableName, exclusive: true, context))
             {
-                TriggerName = createTrigger.TriggerName,
-                TableName = createTrigger.TableName,
-                EventType = createTrigger.EventType,
-                Timing = createTrigger.Timing,
-                ActionSql = createTrigger.ActionSql
-            };
+                if (!catalog.TableExists(createTrigger.TableName))
+                {
+                    return ExecuteResult.Error($"Table '{createTrigger.TableName}' does not exist for trigger.");
+                }
 
-            catalog.AddTrigger(trigMeta);
-            return ExecuteResult.Ok($"Trigger '{createTrigger.TriggerName}' created successfully.");
+                var previousTrigger = catalog.GetTrigger(createTrigger.TriggerName);
+                var trigMeta = new TriggerMetadata
+                {
+                    TriggerName = createTrigger.TriggerName,
+                    TableName = createTrigger.TableName,
+                    EventType = createTrigger.EventType,
+                    Timing = createTrigger.Timing,
+                    ActionSql = createTrigger.ActionSql
+                };
+
+                if (context.ActiveTransaction != null)
+                {
+                    catalog.AddTriggerInMemory(trigMeta);
+                    context.ActiveTransaction.RegisterRollback(() =>
+                    {
+                        if (previousTrigger != null)
+                        {
+                            catalog.AddTriggerInMemory(previousTrigger);
+                        }
+                        else
+                        {
+                            catalog.RemoveTriggerInMemory(trigMeta.TriggerName);
+                        }
+                    });
+                    context.ActiveTransaction.RegisterCommit(() => catalog.Save());
+                }
+                else
+                {
+                    catalog.AddTrigger(trigMeta);
+                }
+
+                return ExecuteResult.Ok($"Trigger '{createTrigger.TriggerName}' created successfully.");
+            }
+        }
+
+        private async Task<ExecuteResult> ExecuteDropTrigger(DropTriggerStatement dropTrigger, ExecutionContext context)
+        {
+            var catalog = context.Catalog;
+            var existing = catalog.GetTrigger(dropTrigger.TriggerName);
+            if (existing == null)
+            {
+                return ExecuteResult.Error($"Trigger '{dropTrigger.TriggerName}' does not exist.");
+            }
+
+            using (await AcquireLockAsync(existing.TableName, exclusive: true, context))
+            {
+                existing = catalog.GetTrigger(dropTrigger.TriggerName);
+                if (existing == null)
+                {
+                    return ExecuteResult.Error($"Trigger '{dropTrigger.TriggerName}' does not exist.");
+                }
+
+                if (context.ActiveTransaction != null)
+                {
+                    var removed = catalog.RemoveTriggerInMemory(dropTrigger.TriggerName);
+                    if (removed != null)
+                    {
+                        context.ActiveTransaction.RegisterRollback(() => catalog.AddTriggerInMemory(removed));
+                        context.ActiveTransaction.RegisterCommit(() => catalog.Save());
+                    }
+                }
+                else
+                {
+                    catalog.RemoveTrigger(dropTrigger.TriggerName);
+                }
+
+                return ExecuteResult.Ok($"Trigger '{dropTrigger.TriggerName}' dropped successfully.");
+            }
         }
 
         private async Task RunTriggersAsync(string tableName, string eventType, string timing, DataFrame? inserted, DataFrame? deleted, ExecutionContext context)
@@ -138,14 +191,29 @@ namespace Glacier.Sql.Engine
             }
         }
 
-        private bool HasInsteadOfTrigger(string tableName, string eventType, ExecutionContext context)
+        private static bool HasInsteadOfTrigger(string tableName, string eventType, ExecutionContext context)
         {
             var persistentTriggers = context.Catalog.GetTriggersForTable(tableName, eventType);
             return persistentTriggers.Any(t => t.Timing.Equals("INSTEAD OF", StringComparison.OrdinalIgnoreCase) &&
                                                t.EventType.Equals(eventType, StringComparison.OrdinalIgnoreCase));
         }
 
-        private ISeries CreateNullSeries(string name, string dataType, int length)
+        private static bool HasAfterTrigger(string tableName, string eventType, ExecutionContext context)
+        {
+            if (context.Triggers.Any(t =>
+                    t.TableName.Equals(tableName, StringComparison.OrdinalIgnoreCase) &&
+                    t.EventType.Equals(eventType, StringComparison.OrdinalIgnoreCase)))
+            {
+                return true;
+            }
+
+            var persistentTriggers = context.Catalog.GetTriggersForTable(tableName, eventType);
+            return persistentTriggers.Any(t =>
+                t.Timing.Equals("AFTER", StringComparison.OrdinalIgnoreCase) &&
+                t.EventType.Equals(eventType, StringComparison.OrdinalIgnoreCase));
+        }
+
+        private static ISeries CreateNullSeries(string name, string dataType, int length)
         {
             string dt = dataType.ToUpperInvariant();
             if (dt == "INT" || dt == "INTEGER")
@@ -295,7 +363,7 @@ namespace Glacier.Sql.Engine
             throw new NotSupportedException($"Data type '{dataType}' is not supported.");
         }
 
-        private object? ConvertValue(object? val, string dataType)
+        private static object? ConvertValue(object? val, string dataType)
         {
             if (val == null) return null;
 
@@ -484,7 +552,14 @@ namespace Glacier.Sql.Engine
                 {
                     for (int i = acquired.Count - 1; i >= 0; i--)
                     {
-                        try { acquired[i].Dispose(); } catch { }
+                        try
+                        {
+                            acquired[i].Dispose();
+                        }
+                        catch (Exception ex)
+                        {
+                            GlacierSqlDiagnostics.LogError($"Error releasing statement lock: {ex.Message}", ex);
+                        }
                     }
                 });
             }
@@ -492,7 +567,14 @@ namespace Glacier.Sql.Engine
             {
                 for (int i = acquired.Count - 1; i >= 0; i--)
                 {
-                    try { acquired[i].Dispose(); } catch { }
+                    try
+                    {
+                        acquired[i].Dispose();
+                    }
+                    catch (Exception ex)
+                    {
+                        GlacierSqlDiagnostics.LogError($"Error releasing lock during cleanup: {ex.Message}", ex);
+                    }
                 }
                 throw;
             }
@@ -535,10 +617,24 @@ namespace Glacier.Sql.Engine
                 var viewMeta = catalog.GetView(name);
                 if (viewMeta != null)
                 {
-                    var lexer = new SqlLexer(viewMeta.DefinitionSql);
-                    var tokens = lexer.Tokenize();
-                    var parser = new TSqlParser(tokens);
-                    if (parser.Parse() is SelectStatement viewSelect)
+                    SelectStatement? viewSelect = null;
+                    if (catalog.TryGetCachedView(name, viewMeta.DefinitionSql, out var cachedAst, out _) && cachedAst != null)
+                    {
+                        viewSelect = cachedAst;
+                    }
+                    else
+                    {
+                        var lexer = new SqlLexer(viewMeta.DefinitionSql);
+                        var tokens = lexer.Tokenize();
+                        var parser = new TSqlParser(tokens);
+                        if (parser.Parse() is SelectStatement parsed)
+                        {
+                            viewSelect = parsed;
+                            catalog.CacheView(name, viewMeta.DefinitionSql, parsed, null);
+                        }
+                    }
+
+                    if (viewSelect != null)
                     {
                         CollectSelectLockRequests(viewSelect, catalog, lockRequests, exclusive, visitedViews);
                     }
@@ -655,36 +751,19 @@ namespace Glacier.Sql.Engine
                 var series = df.Columns.FirstOrDefault(c => c.Name.Equals(col.Name, StringComparison.OrdinalIgnoreCase));
                 if (series == null) continue;
 
-                // 1. NOT NULL / PRIMARY KEY
+                // 1. NOT NULL / PRIMARY KEY (O(1) bitmask word scan)
                 if (!col.IsNullable || col.IsPrimaryKey)
                 {
-                    for (int r = 0; r < series.Length; r++)
+                    if (series.ValidityMask.HasNulls)
                     {
-                        if (!series.ValidityMask.IsValid(r))
-                        {
-                            throw new Exception($"Cannot insert or update NULL into NOT NULL column '{col.Name}' in table '{meta.TableName}'.");
-                        }
+                        throw new Exception($"Cannot insert or update NULL into NOT NULL column '{col.Name}' in table '{meta.TableName}'.");
                     }
                 }
 
-                // 2. UNIQUE / PRIMARY KEY
+                // 2. UNIQUE / PRIMARY KEY (zero-boxing typed checks)
                 if (col.IsUnique || col.IsPrimaryKey)
                 {
-                    var values = new HashSet<object>();
-                    for (int r = 0; r < series.Length; r++)
-                    {
-                        if (series.ValidityMask.IsValid(r))
-                        {
-                            var val = series.Get(r);
-                            if (val != null)
-                            {
-                                if (!values.Add(val))
-                                {
-                                    throw new Exception($"Violation of UNIQUE/PRIMARY KEY constraint on column '{col.Name}' in table '{meta.TableName}'. Duplicate value '{val}' is not allowed.");
-                                }
-                            }
-                        }
-                    }
+                    ValidateUniqueSeries(meta.TableName, col.Name, new[] { series });
                 }
 
                 // 3. CHECK
@@ -701,6 +780,217 @@ namespace Glacier.Sql.Engine
                     if (violatingDf.RowCount > 0)
                     {
                         throw new Exception($"Violation of CHECK constraint '{col.CheckExpression}' on column '{col.Name}' in table '{meta.TableName}'.");
+                    }
+                }
+            }
+        }
+
+        private async Task ValidateInsertConstraintsAsync(
+            TableMetadata meta,
+            IReadOnlyList<DataFrame> existingChunks,
+            DataFrame newRowsDf,
+            ExecutionContext context)
+        {
+            _ = context;
+            foreach (var col in meta.Columns)
+            {
+                var newSeries = newRowsDf.Columns.FirstOrDefault(c => c.Name.Equals(col.Name, StringComparison.OrdinalIgnoreCase));
+                if (newSeries == null) continue;
+
+                // 1. NOT NULL / PRIMARY KEY (only need to check incoming rows)
+                if (!col.IsNullable || col.IsPrimaryKey)
+                {
+                    if (newSeries.ValidityMask.HasNulls)
+                    {
+                        throw new Exception($"Cannot insert or update NULL into NOT NULL column '{col.Name}' in table '{meta.TableName}'.");
+                    }
+                }
+
+                // 2. UNIQUE / PRIMARY KEY across existing chunks + new rows (zero DataFrame.Concat, zero boxing)
+                if (col.IsUnique || col.IsPrimaryKey)
+                {
+                    var allColSeries = new List<ISeries>(existingChunks.Count + 1);
+                    for (int i = 0; i < existingChunks.Count; i++)
+                    {
+                        var existingCol = existingChunks[i].Columns.FirstOrDefault(c => c.Name.Equals(col.Name, StringComparison.OrdinalIgnoreCase));
+                        if (existingCol != null && existingCol.Length > 0)
+                        {
+                            allColSeries.Add(existingCol);
+                        }
+                    }
+                    allColSeries.Add(newSeries);
+                    ValidateUniqueSeries(meta.TableName, col.Name, allColSeries);
+                }
+
+                // 3. CHECK (only need to evaluate against new rows)
+                if (!string.IsNullOrEmpty(col.CheckExpression))
+                {
+                    var lexer = new SqlLexer(col.CheckExpression);
+                    var tokens = lexer.Tokenize();
+                    var parser = new TSqlParser(tokens);
+                    var checkExpr = parser.ParseExpression(0);
+
+                    var compiled = _planner.CompileExpression(checkExpr, meta.TableName);
+
+                    var violatingDf = await newRowsDf.Lazy().Filter((compiled == Expr.Lit(false)) & compiled.IsNotNull()).Collect();
+                    if (violatingDf.RowCount > 0)
+                    {
+                        throw new Exception($"Violation of CHECK constraint '{col.CheckExpression}' on column '{col.Name}' in table '{meta.TableName}'.");
+                    }
+                }
+            }
+        }
+
+        private static void ValidateUniqueSeries(string tableName, string colName, IReadOnlyList<ISeries> seriesList)
+        {
+            if (seriesList.Count == 0) return;
+
+            var first = seriesList[0];
+            if (first is Int32Series)
+            {
+                var set = new HashSet<int>();
+                for (int s = 0; s < seriesList.Count; s++)
+                {
+                    var i32 = (Int32Series)seriesList[s];
+                    var span = i32.Memory.Span;
+                    var mask = i32.ValidityMask;
+                    bool hasNulls = mask.HasNulls;
+                    for (int r = 0; r < i32.Length; r++)
+                    {
+                        if (hasNulls && !mask.IsValid(r)) continue;
+                        int val = span[r];
+                        if (!set.Add(val))
+                        {
+                            throw new Exception($"Violation of UNIQUE/PRIMARY KEY constraint on column '{colName}' in table '{tableName}'. Duplicate value '{val}' is not allowed.");
+                        }
+                    }
+                }
+            }
+            else if (first is Float64Series)
+            {
+                var set = new HashSet<double>();
+                for (int s = 0; s < seriesList.Count; s++)
+                {
+                    var f64 = (Float64Series)seriesList[s];
+                    var span = f64.Memory.Span;
+                    var mask = f64.ValidityMask;
+                    bool hasNulls = mask.HasNulls;
+                    for (int r = 0; r < f64.Length; r++)
+                    {
+                        if (hasNulls && !mask.IsValid(r)) continue;
+                        double val = span[r];
+                        if (!set.Add(val))
+                        {
+                            throw new Exception($"Violation of UNIQUE/PRIMARY KEY constraint on column '{colName}' in table '{tableName}'. Duplicate value '{val}' is not allowed.");
+                        }
+                    }
+                }
+            }
+            else if (first is TimeSeries)
+            {
+                var set = new HashSet<long>();
+                for (int s = 0; s < seriesList.Count; s++)
+                {
+                    var ts = (TimeSeries)seriesList[s];
+                    var span = ts.Memory.Span;
+                    var mask = ts.ValidityMask;
+                    bool hasNulls = mask.HasNulls;
+                    for (int r = 0; r < ts.Length; r++)
+                    {
+                        if (hasNulls && !mask.IsValid(r)) continue;
+                        long val = span[r];
+                        if (!set.Add(val))
+                        {
+                            throw new Exception($"Violation of UNIQUE/PRIMARY KEY constraint on column '{colName}' in table '{tableName}'. Duplicate value '{val}' is not allowed.");
+                        }
+                    }
+                }
+            }
+            else if (first is BooleanSeries)
+            {
+                bool seenTrue = false;
+                bool seenFalse = false;
+                for (int s = 0; s < seriesList.Count; s++)
+                {
+                    var bs = (BooleanSeries)seriesList[s];
+                    var span = bs.Memory.Span;
+                    var mask = bs.ValidityMask;
+                    bool hasNulls = mask.HasNulls;
+                    for (int r = 0; r < bs.Length; r++)
+                    {
+                        if (hasNulls && !mask.IsValid(r)) continue;
+                        bool val = span[r];
+                        if (val)
+                        {
+                            if (seenTrue)
+                            {
+                                throw new Exception($"Violation of UNIQUE/PRIMARY KEY constraint on column '{colName}' in table '{tableName}'. Duplicate value '{val}' is not allowed.");
+                            }
+                            seenTrue = true;
+                        }
+                        else
+                        {
+                            if (seenFalse)
+                            {
+                                throw new Exception($"Violation of UNIQUE/PRIMARY KEY constraint on column '{colName}' in table '{tableName}'. Duplicate value '{val}' is not allowed.");
+                            }
+                            seenFalse = true;
+                        }
+                    }
+                }
+            }
+            else if (first is Utf8StringSeries)
+            {
+                var set = new HashSet<string>(StringComparer.Ordinal);
+                var lookup = set.GetAlternateLookup<ReadOnlySpan<char>>();
+                Span<char> stackBuf = stackalloc char[256];
+                for (int s = 0; s < seriesList.Count; s++)
+                {
+                    var u8 = (Utf8StringSeries)seriesList[s];
+                    var mask = u8.ValidityMask;
+                    bool hasNulls = mask.HasNulls;
+                    for (int r = 0; r < u8.Length; r++)
+                    {
+                        if (hasNulls && !mask.IsValid(r)) continue;
+                        var utf8Bytes = u8.GetStringSpan(r);
+                        int maxChars = Encoding.UTF8.GetMaxCharCount(utf8Bytes.Length);
+                        char[]? rented = maxChars > stackBuf.Length ? ArrayPool<char>.Shared.Rent(maxChars) : null;
+                        Span<char> charBuf = rented != null ? rented : stackBuf;
+                        try
+                        {
+                            int charCount = Encoding.UTF8.GetChars(utf8Bytes, charBuf);
+                            var charSpan = charBuf.Slice(0, charCount);
+                            if (!lookup.Add(charSpan))
+                            {
+                                throw new Exception($"Violation of UNIQUE/PRIMARY KEY constraint on column '{colName}' in table '{tableName}'. Duplicate value '{charSpan.ToString()}' is not allowed.");
+                            }
+                        }
+                        finally
+                        {
+                            if (rented != null)
+                            {
+                                ArrayPool<char>.Shared.Return(rented);
+                            }
+                        }
+                    }
+                }
+            }
+            else
+            {
+                var values = new HashSet<object>();
+                for (int s = 0; s < seriesList.Count; s++)
+                {
+                    var series = seriesList[s];
+                    var mask = series.ValidityMask;
+                    bool hasNulls = mask.HasNulls;
+                    for (int r = 0; r < series.Length; r++)
+                    {
+                        if (hasNulls && !mask.IsValid(r)) continue;
+                        var val = series.Get(r);
+                        if (val != null && !values.Add(val))
+                        {
+                            throw new Exception($"Violation of UNIQUE/PRIMARY KEY constraint on column '{colName}' in table '{tableName}'. Duplicate value '{val}' is not allowed.");
+                        }
                     }
                 }
             }

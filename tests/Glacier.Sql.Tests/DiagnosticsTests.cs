@@ -212,8 +212,8 @@ public class DiagnosticsTests
             string invalidCatalogFile = Path.Combine(tempDir, "catalog.json");
             File.WriteAllText(invalidCatalogFile, "{ malformed json corrupt content");
 
-            // Initializing CatalogManager on corrupted catalog file invokes Load() which catches and logs error
-            var cm = new CatalogManager(tempDir);
+            // Initializing CatalogManager on corrupted catalog file logs error and fails closed with InvalidDataException
+            Assert.Throws<InvalidDataException>(() => new CatalogManager(tempDir));
 
             // Verify that the error was captured in ambient diagnostics
             Assert.Contains(loggedErrors, entry => entry.Level == LogLevel.Error && entry.Message.Contains("Error loading catalog"));
