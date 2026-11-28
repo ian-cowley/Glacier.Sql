@@ -2,163 +2,116 @@
 
 # Glacier.Sql
 
+[![CI](https://github.com/ian-cowley/Glacier.Sql/actions/workflows/dotnet.yml/badge.svg)](https://github.com/ian-cowley/Glacier.Sql/actions/workflows/dotnet.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![.NET 10](https://img.shields.io/badge/.NET-10.0-purple.svg)](https://dotnet.microsoft.com/)
-[![Native AOT](https://img.shields.io/badge/Native%20AOT-Ready-brightgreen.svg)](https://learn.microsoft.com/dotnet/core/deploying/native-aot/)
-[![NuGet Version](https://img.shields.io/nuget/v/Glacier.Sql.svg)](https://www.nuget.org/packages/Glacier.Sql/)
-[![NuGet Downloads](https://img.shields.io/nuget/dt/Glacier.Sql.svg)](https://www.nuget.org/packages/Glacier.Sql/)
-[![Ecosystem](https://img.shields.io/badge/Glacier-Ecosystem-blue)](https://github.com/ian-cowley)
-[![Website](https://img.shields.io/badge/Website-glaciersoftware.dev-66fcf1.svg)](https://glaciersoftware.dev/)
-[![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-Support-orange.svg?logo=buy-me-a-coffee)](https://buymeacoffee.com/glaciersoftware)
+![.NET 10](https://img.shields.io/badge/.NET-10.0-purple.svg)
+![NativeAOT](https://img.shields.io/badge/NativeAOT-Compatible-brightgreen.svg)
 
-**Glacier.Sql** is a high-performance, Native AOT-compatible C# SQL query execution engine built directly on top of the **Glacier.Polaris** columnar, memory-efficient Arrow-backed DataFrame engine. It translates T-SQL queries into optimized Polaris `LazyFrame` expression pipelines, combining zero-copy columnar reads with an in-memory `TableBufferPool`, async-native table locking, and deterministic Write-Ahead Logging (WAL).
+`Glacier.Sql` is an embedded transactional T-SQL query engine for .NET 10 backed by `Glacier.Polaris` columnar DataFrames and Apache Arrow IPC files. It parses SQL into an abstract syntax tree, compiles queries into vectorized `LazyFrame` pipelines, and protects mutations with a CRC32-verified Write-Ahead Log (`glacier.wal`), async reader-writer table locks, views, triggers, and a stdio MCP server host (`Glacier.Sql.Host`).
 
 ---
 
-## Features
+## Install
 
-- **T-SQL Parser & AST**: Zero-allocation `ReadOnlySpan<char>` & ASCII-folding byte-Trie `SqlLexer` and Pratt/recursive-descent `TSqlParser` (with `SqlSyntaxException`, strict `EOF` checking, and `;` terminators) implementing `SELECT` (with `GROUP BY`, `HAVING`, `ORDER BY` expressions, `TOP`, `INNER`/`LEFT [OUTER]`/`RIGHT [OUTER]`/`FULL [OUTER]`/`CROSS JOIN`), multi-row `INSERT ... VALUES (...), (...)`, `INSERT ... SELECT`, `UPDATE`, `DELETE`, `CREATE`/`ALTER`/`DROP TABLE`, `CREATE`/`DROP VIEW`, `CREATE`/`DROP TRIGGER`, and `BEGIN`/`COMMIT`/`ROLLBACK TRANSACTION`.
-- **Post-Aggregate & Standard `HAVING` / `ORDER BY`**: Full aggregate extraction and deduplication across `SELECT`, `HAVING`, and `ORDER BY` — supporting projected and unprojected aggregates (`HAVING COUNT(*) > 2`), compound `AND`/`OR` predicates, non-aggregate `HAVING` & `ORDER BY` expressions, projection aliases, and global aggregate filtering.
-- **Deterministic WAL v2 & Crash Recovery**: Hardware-accelerated IEEE 802.3 CRC32 (`System.IO.Hashing.Crc32`), `Guid TableId`-keyed WAL v2 frames (preventing drop+recreate replay corruption), compact `RowDeleteDelta`/`RowUpdateDelta` row-ID records, $O(1)$ amortized chunked `INSERT` buffering, fail-closed header validation, monotonic LSN recovery across restarts, automatic WAL truncation on clean checkpoints, and uncommitted transaction isolation (including transactional DDL & auto-commit `AFTER` trigger rollback).
-- **Async-Native Concurrency (`AsyncReaderWriterLock`)**: Fair, non-blocking async reader-writer table locks with deadlock-safe `UpgradeReadToWriteAsync`, canonical multi-table lock ordering across joins/views/subqueries, locked `INSTEAD OF` triggers, and re-entrant trigger execution contexts.
-- **Native Triggers & Relational Views**: Persistent `AFTER` and `INSTEAD OF` triggers (with `INSTEAD OF UPDATE` running prior to base table constraints) using `inserted`/`deleted` virtual tables, plus catalog-persisted views with AST/schema caching.
-- **Correlated Subqueries & Set Membership**: Scalar subqueries, semi-join/hash `IN` / `NOT IN` (with SQL 3-valued `NULL` semantics), and recursive `EXISTS` / `NOT EXISTS` / `OR EXISTS` supporting multi-column and non-`Int32` correlations.
-- **Native AOT & MCP Host**: Source-generated `System.Text.Json` contexts (`CatalogJsonContext` and `SqlMcpJsonContext`) across `Glacier.Sql` and `Glacier.Sql.Host`, isolated via `GLACIER_SQL_DATA_DIR`, gated logging (`GLACIER_SQL_MCP_LOG`), `isError` reporting, and `maxResults`/`offset` pagination.
+Add the core engine library:
 
----
-
-## Data Types
-
-Glacier.Sql supports the following SQL-to-Polaris data types:
-
-| SQL Type | Polaris Underlay | Description | Example Literal |
-| :--- | :--- | :--- | :--- |
-| **`INT`** | `Int32Series` | 32-bit signed integer | `123`, `-42` |
-| **`FLOAT`** / **`DOUBLE`** | `Float64Series` | 64-bit double precision float | `123.45`, `-3.14` |
-| **`BIT`** / **`BOOLEAN`** | `BooleanSeries` | Logical true/false boolean | `1` / `TRUE`, `0` / `FALSE` |
-| **`VARCHAR`** / **`TEXT`** | `Utf8StringSeries` | UTF-8 encoded text string | `'Hello World'` |
-| **`DATETIME`** / **`DATE`** | `TimeSeries` | Unix epoch timestamp (ms) | `'2026-05-26'` |
-
----
-
-## SQL Examples & Usage
-
-### 1. Aggregations, `HAVING` & Post-Group `ORDER BY`
-```sql
-SELECT region, SUM(qty) AS total_qty
-FROM sales
-GROUP BY region
-HAVING COUNT(*) >= 2 AND SUM(qty) > 100
-ORDER BY total_qty DESC;
-```
-
-### 2. Constraints & Table Alterations
-```sql
--- Create table with PRIMARY KEY, UNIQUE, NOT NULL, and CHECK constraints
-CREATE TABLE customers (
-    customer_id INT PRIMARY KEY,
-    name VARCHAR NOT NULL,
-    email VARCHAR UNIQUE,
-    age INT CHECK (age >= 18)
-);
-
--- Add nullable VARCHAR or INT column (existing rows are padded with valid NULL masks)
-ALTER TABLE customers ADD notes VARCHAR;
-ALTER TABLE customers ADD loyalty_points INT CHECK (loyalty_points >= 0);
-
--- Drop column (atomically updates Arrow IPC storage and WAL checkpoint boundary)
-ALTER TABLE customers DROP COLUMN loyalty_points;
-```
-
-### 3. Transactions & Triggers
-```sql
-CREATE TRIGGER audit_log ON orders
-AFTER INSERT
-AS
-INSERT INTO order_history
-SELECT id, qty, 'INSERTED' FROM inserted;
-
-BEGIN TRANSACTION;
-INSERT INTO orders VALUES (10, 50);
-UPDATE inventory SET stock = stock - 10 WHERE item_id = 1;
-COMMIT; -- Or ROLLBACK to restore pre-transaction snapshot
-```
-
-### 4. Views & Correlated Subqueries
-```sql
-CREATE VIEW active_customers AS
-SELECT customer_id, name
-FROM customers
-WHERE age >= 18;
-
-SELECT val FROM t_a
-WHERE EXISTS (
-    SELECT * FROM t_b
-    WHERE t_b.id = t_a.id AND score >= 90
-);
-```
-
----
-
-## Getting Started
-
-### Prerequisites
-- .NET 10.0 SDK
-
-### Build the Solution
 ```bash
-dotnet build Glacier.Sql.slnx -c Release
+dotnet add package Glacier.Sql
 ```
 
-### Run Tests
+Or clone and run tests / launch the MCP server from source:
+
 ```bash
-dotnet test tests/Glacier.Sql.Tests/Glacier.Sql.Tests.csproj -c Release
+git clone https://github.com/ian-cowley/Glacier.Sql.git
+cd Glacier.Sql
+dotnet test Glacier.Sql.slnx -c Release
+dotnet run --project src/Glacier.Sql.Host/Glacier.Sql.Host.csproj -c Release -- --data-dir ./db
 ```
 
-### Start the MCP Server Host
-The executable host runs a Native AOT-compatible JSON-RPC Model Context Protocol (MCP) server over stdio:
-```bash
-dotnet run --project src/Glacier.Sql.Host/Glacier.Sql.Host.csproj -c Release
+---
+
+## Quick Start
+
+```csharp
+using Glacier.Sql.Catalog;
+using Glacier.Sql.Engine;
+
+using var catalog = new CatalogManager("./my_glacier_db");
+var engine = new SqlEngine(catalog);
+var context = new ExecutionContext(catalog);
+
+await engine.ExecuteAsync(@"
+    CREATE TABLE customers (
+        customer_id INT PRIMARY KEY,
+        name VARCHAR NOT NULL,
+        age INT CHECK (age >= 18)
+    );", context);
+
+await engine.ExecuteAsync(
+    "INSERT INTO customers VALUES (1, 'Alice', 30), (2, 'Bob', 24);",
+    context);
+
+ExecuteResult res = await engine.ExecuteAsync(
+    "SELECT name, age FROM customers WHERE age >= 25 ORDER BY age DESC;",
+    context);
+
+if (res.Success && res.DataFrame != null)
+{
+    Console.WriteLine($"Returned {res.DataFrame.RowCount} row(s).");
+}
+
+catalog.Checkpoint();
 ```
-- **Data Directory**: Resolved via `--data-dir <path>` -> `GLACIER_SQL_DATA_DIR` environment variable -> `%LOCALAPPDATA%/Glacier/Sql/Data` (never writes `Data/` into `AppContext.BaseDirectory`).
-- **Diagnostic Logging**: Disabled by default. Set `GLACIER_SQL_MCP_LOG=1` (writes inside the resolved data directory) or an explicit file path to enable `mcp_sql_log.txt`.
-- **Pagination**: `execute_sql` accepts optional `maxResults` (default `200`, max `1000`) and `offset` (default `0`) arguments.
+
+---
+
+## What You Can Do
+
+- **T-SQL Parsing & Columnar Execution:** Tokenize and parse DDL, DML, and DQL (`SELECT`, `TOP n`, `INNER`/`LEFT`/`RIGHT`/`FULL`/`CROSS JOIN`, `GROUP BY`, `HAVING`, `ORDER BY`) compiled into `Glacier.Polaris` `LazyFrame` execution plans.
+- **Constraints & Triggers:** Enforce `PRIMARY KEY`, `UNIQUE`, `NOT NULL`, and `CHECK` constraints, plus recursive `AFTER` and `INSTEAD OF` triggers with virtual `inserted` and `deleted` tables.
+- **Views & Subqueries:** Persist SQL views expanded transparently during query planning, alongside scalar subqueries, `IN` / `NOT IN` (3-valued `NULL` semantics), and correlated `EXISTS` / `NOT EXISTS`.
+- **ACID Transactions & WAL Crash Recovery:** Group statements with `BEGIN TRANSACTION`, `COMMIT`, and `ROLLBACK`, backed by in-memory `TableBufferPool` caching, CRC32-framed `glacier.wal`, `AsyncReaderWriterLock`, and `.ipc` table checkpoints.
+- **Catalog Introspection & MCP Server:** Query `INFORMATION_SCHEMA.TABLES` / `INFORMATION_SCHEMA.COLUMNS`, or attach AI coding clients directly over JSON-RPC stdio via `Glacier.Sql.Host` (`execute_sql`, `list_tables`, `get_table_schema`).
+
+---
+
+## Platform & Compatibility
+
+- **Runtime:** .NET 10 (`net10.0`), Native AOT compatible (`IsAotCompatible=true`).
+- **Storage Format:** Central `catalog.json` metadata + per-table Apache Arrow IPC files (`*.ipc`) + binary CRC32 WAL (`glacier.wal`).
+- **Cross-Platform:** Tested on Windows and Linux x64 in GitHub Actions CI.
+
+---
+
+## Benchmarks
+
+Measured in `Release` on Windows 11 with an AMD Ryzen AI 9 HX 370 (Zen 5, AVX-512). Reproduce with `dotnet run --project benchmarks/Glacier.Sql.Benchmarks/Glacier.Sql.Benchmarks.csproj -c Release`:
+
+| Pipeline Stage | Workload | Throughput | Latency | Allocation |
+| :--- | :--- | ---: | ---: | ---: |
+| `SqlLexer.Tokenize` | Simple `SELECT` | 770,402 ops/s | 1.30 us | 1,184.0 B/op |
+| `SqlLexer.Tokenize` | `INSERT` Batch | 2,309,367 ops/s | 0.43 us | 1,808.0 B/op |
+| `TSqlParser.Parse` | Simple `SELECT` AST | 817,643 ops/s | 1.22 us | 640.0 B/op |
+| `TSqlParser.Parse` | Complex `JOIN` AST | 615,680 ops/s | 1.62 us | 1,480.0 B/op |
+| `QueryPlanner.PlanQuery` | Plan Simple `SELECT` | 96,739 ops/s | 10.34 us | 6,848.4 B/op |
+| `QueryPlanner.PlanQuery` | Plan `AGG` + `GROUP BY` | 155,558 ops/s | 6.43 us | 11,928.0 B/op |
+
+See [the full benchmark suite](docs/benchmarks.md) for all 13 operations across lexer, parser, and query planner stages.
 
 ---
 
 ## Documentation
 
-- **[Architecture Overview (`ARCHITECTURE.md`)](ARCHITECTURE.md)** — Deep dive into the query compilation pipeline, `AsyncReaderWriterLock` concurrency protocol, `TableBufferPool` snapshot isolation, and binary WAL frame/checkpoint design.
-- **[Glacier.Sql Reference Manual (`MANUAL.md`)](MANUAL.md)** — Comprehensive SQL syntax reference and MCP host usage guide.
+- [SQL & API Manual](docs/manual.md) — T-SQL syntax, types, constraints, joins, subqueries, triggers, transactions, and C# API
+- [Architecture](docs/architecture.md) — Lexer/Pratt parser, Polaris planner compilation, `TableBufferPool`, WAL v2 recovery, and `AsyncReaderWriterLock`
+- [MCP Server Setup](docs/mcp.md) — Connecting AI clients to `Glacier.Sql.Host` (`execute_sql`, `list_tables`, `get_table_schema`)
+- [Benchmarks](docs/benchmarks.md) — Full Release microbenchmarks and BenchmarkDotNet reproduction commands
+- [Changelog](CHANGELOG.md) — Version history
 
 ---
 
-## 🆕 What's New in v1.1.1
+## License & Credits
 
-- **Hardened Concurrency, Triggers & Transactional DDL** — Exclusive locking on `INSTEAD OF INSERT`, `INSTEAD OF UPDATE` ordered before constraint checks, automatic implicit-transaction rollback on failing `AFTER` triggers, LIFO transaction rollback, and full transactional DDL (`CREATE`/`DROP`/`ALTER TABLE`, `CREATE`/`DROP VIEW`, `CREATE`/`DROP TRIGGER`).
-- **WAL v2, Hardware CRC32 & $O(1)$ Delta Buffering** — `System.IO.Hashing.Crc32` hardware acceleration, `Guid TableId`-keyed WAL v2 frames (immune to drop+recreate replay), compact `RowDeleteDelta`/`RowUpdateDelta` frames, `ArrayPool` WAL buffering, checkpoint WAL truncation, fail-closed corrupt `catalog.json`/WAL header guards, and chunked `TableBufferEntry` appends.
-- **Span/Trie Lexer, Planner & MCP Host Hardening** — Zero-alloc `ReadOnlySpan<char>` + byte-Trie `SqlLexer`, `SqlSyntaxException` with `EOF` enforcement, multi-row `INSERT`, `NOT IN` 3-valued `NULL` handling, `COUNT(*)` NULL accuracy, multi-key/OR `EXISTS`, `RIGHT`/`FULL`/`LEFT OUTER` & swapped `ON` joins, async planner (`PlanQueryAsync`), view AST/schema caching, and `GLACIER_SQL_DATA_DIR` + `maxResults`/`offset` host isolation.
-- **81 unit, concurrency & durability tests** passing (100% green).
+Licensed under the [MIT License](LICENSE).
 
----
-
-## Credits
-
-Developed by Ian Cowley and Antigravity (Google DeepMind).
-
----
-
-## License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
----
-
-## ❄️ Glacier Ecosystem & Support
-
-Part of the **[Glacier Ecosystem](https://glaciersoftware.dev/)** — high-performance, zero-allocation developer tooling and data engines natively built for modern C# and .NET 10.
-
-* 🌐 **Website & Documentation**: [glaciersoftware.dev](https://glaciersoftware.dev/)
-* ☕ **Buy Me a Coffee**: [buymeacoffee.com/glaciersoftware](https://buymeacoffee.com/glaciersoftware)
-* ❤️ **GitHub Sponsors**: [github.com/sponsors/ian-cowley](https://github.com/sponsors/ian-cowley)
-* 🐙 **All Repositories**: [github.com/ian-cowley](https://github.com/ian-cowley)
+Developed by Ian Cowley, Antigravity (Google DeepMind) and Claude.
